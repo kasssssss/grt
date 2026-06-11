@@ -1,0 +1,7 @@
+dataset:
+  # Small but non-Baum subset sampled from all official train trace groups.
+  # The dataset root itself is the complete I/Q-1M tree.
+  ptrain: 0.0005
+  pval: 0.0005
+  batch_size: 4
+  val_samples: 8

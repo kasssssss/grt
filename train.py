@@ -12,6 +12,7 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.strategies import DDPStrategy
 
 from deepradar import DeepRadar, config
+from deepradar.pretrained import load_official_grt_base
 
 
 def _parse():
@@ -64,6 +65,15 @@ def _parse():
     g.add_argument(
         "-f", "--freeze", action='store_true', default=False,
         help="Freeze encoder (i.e. don't allow tuning the encoder).")
+    g.add_argument(
+        "--official_base_model", default=None,
+        help="Official NRDK-format GRT model directory to use for initialization.")
+    g.add_argument(
+        "--official_elevation_index", default=0, type=int,
+        help="Official elevation bin to select when adapting the input patch.")
+    g.add_argument(
+        "--official_skip_decoder", default=False, action='store_true',
+        help="Only load official tokenizer/encoder weights, skipping decoder.")
 
     g = p.add_argument_group("Logging")
     g.add_argument(
@@ -139,6 +149,16 @@ def _main(args):
             model.decoder.load_state_dict(
                 base.decoder.state_dict(), strict=False)
 
+    # Use official NRDK-format GRT model as initialization.
+    if args.official_base_model is not None:
+        report = load_official_grt_base(
+            model,
+            args.official_base_model,
+            elevation_index=args.official_elevation_index,
+            load_decoder=not args.official_skip_decoder,
+        )
+        print("OFFICIAL_INIT " + json.dumps(report, indent=2), flush=True)
+
     # Metadata/logging-related config bypasses save_hyperparameters
     model.configure(log_interval=args.log_example_interval, num_examples=16)
 
@@ -151,11 +171,22 @@ def _main(args):
     logger = TensorBoardLogger(
         args.out, name=args.name, version=args.version,
         default_hp_metric=False)
-    strategy = DDPStrategy(find_unused_parameters=args.find_unused)
+    accelerator = "gpu" if torch.cuda.is_available() else "auto"
+    world_size = int(
+        os.environ.get("WORLD_SIZE")
+        or os.environ.get("SLURM_NTASKS")
+        or "1")
+    devices = torch.cuda.device_count() if torch.cuda.is_available() else "auto"
+    strategy = (
+        DDPStrategy(find_unused_parameters=args.find_unused)
+        if world_size > 1 or (
+            torch.cuda.is_available() and torch.cuda.device_count() > 1
+        ) else "auto")
     trainer = L.Trainer(
         logger=logger, log_every_n_steps=args.log_interval,
         callbacks=[checkpoint, stopping], max_steps=-1, max_epochs=args.epochs,
         val_check_interval=args.val_interval, strategy=strategy,
+        accelerator=accelerator, devices=devices,
         precision="16-mixed")
 
     start = time.perf_counter()

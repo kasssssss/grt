@@ -1,0 +1,6 @@
+dataset:
+  # Warm-start run for RADs-like I/Q-1M with official GRT base initialization.
+  ptrain: 0.002
+  pval: 0.001
+  batch_size: 4
+  val_samples: 16

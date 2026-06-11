@@ -7,7 +7,7 @@ from functools import partial
 import numpy as np
 from beartype.typing import Any, Callable, Optional, Sequence, Union, cast
 from jaxtyping import Num, UInt
-from roverd import Dataset
+from deepradar._compat.roverd import Dataset
 
 from . import transforms
 

@@ -1,0 +1,7 @@
+dataset:
+  # Longer 2-GPU continuation run on RADs-like I/Q-1M.
+  # Uses the complete I/Q-1M tree but samples a larger subset than warm smoke.
+  ptrain: 0.01
+  pval: 0.002
+  batch_size: 4
+  val_samples: 32

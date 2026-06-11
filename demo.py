@@ -1,21 +1,18 @@
-"""Evaluate radar model."""
+"""Run realtime radar model demo."""
 
 from argparse import ArgumentParser
 
-import cv2
 import numpy as np
 import torch
 import yaml
-from awr_api import AWRSystem
 from beartype.typing import cast
-from matplotlib import colormaps
 
 from deepradar import DeepRadar
 from demo.pipeline import ModelStream, ProcessingStream
 
 
 def _parse():
-    p = ArgumentParser(description="Evaluate radar model.")
+    p = ArgumentParser(description="Run realtime radar model demo.")
 
     p.add_argument("-t", "--type", help="Model output type.", default='depth')
     p.add_argument("-m", "--model", help="Path to model.")
@@ -25,16 +22,15 @@ def _parse():
         "{model}/checkpoints/.")
     p.add_argument("-c", "--config", help="Radar configuration (yaml).")
     p.add_argument("-s", "--scale", default=1.0, type=float, help="Colormap scale.")
+    p.add_argument(
+        "--dry_run", default=False, action='store_true',
+        help="Load the model and preprocessing pipeline without connecting "
+        "to AWR radar hardware.")
 
     return p
 
 
 def _main(args):
-
-    with open(args.config) as f:
-        cfg = yaml.load(f, Loader=yaml.FullLoader)
-
-    radar = AWRSystem(**cfg)
 
     model = DeepRadar.load_from_experiment(
         args.model, checkpoint=args.checkpoint)
@@ -43,6 +39,28 @@ def _main(args):
     preproc_stream = ProcessingStream.from_config(
         transform=model.dataset["channels"]["radar"]["args"]["transform"])
 
+    if args.dry_run:
+        print("DEMO_DRY_RUN_OK")
+        return
+
+    if args.config is None:
+        raise ValueError("Realtime demo requires `--config <radar yaml>`.")
+
+    try:
+        from awr_api import AWRSystem
+    except ImportError as exc:
+        raise RuntimeError(
+            "Realtime demo requires the external `awr_api` package and "
+            "AWR radar hardware; use `--dry_run` for cluster validation."
+        ) from exc
+
+    import cv2
+    from matplotlib import colormaps
+
+    with open(args.config) as f:
+        cfg = yaml.load(f, Loader=yaml.FullLoader)
+
+    radar = AWRSystem(**cfg)
     out_stream = model_stream.apply(
         preproc_stream.apply(radar.qstream(numpy=True)))
 

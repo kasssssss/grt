@@ -1,0 +1,7 @@
+dataset:
+  traces:
+  - outdoor/baum
+  batch_size: 1
+  val_samples: 1
+  ptrain: 0.0001
+  pval: 0.0001

@@ -244,7 +244,13 @@ class RoverDataModule(L.LightningDataModule):
         self._paths = [os.path.join(self.base, t) for t in self.traces]
         self._channels = channels
 
-        self.batch_size = batch_size // torch.cuda.device_count()
+        world_size = int(
+            os.environ.get("WORLD_SIZE")
+            or os.environ.get("SLURM_NTASKS")
+            or "1")
+        if world_size <= 1:
+            world_size = max(1, torch.cuda.device_count())
+        self.batch_size = max(1, batch_size // world_size)
 
         if n_workers is None:
             self.nproc = min(32, multiprocessing.cpu_count())

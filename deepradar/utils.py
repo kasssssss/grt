@@ -98,7 +98,8 @@ def polar3_to_bev(
 
         # Special case for empty: just give a blank result
         if iz.shape[0] == 0:
-            res.append(torch.zeros(nr, nr * 2, dtype=torch.uint8))
+            res.append(torch.zeros(
+                nr, nr * 2, dtype=torch.uint8, device=data.device))
         else:
             zmin = torch.min(iz) - 1
             zmax = 127 - torch.max(iz)
@@ -147,7 +148,12 @@ def comparison_grid(
         y_true = _normalize(y_true)
         y_hat = _normalize(y_hat)
 
-    nrows = y_true.shape[0] // cols
+    batch = y_true.shape[0]
+    if batch == 0:
+        return np.zeros((1, 1, 3), dtype=np.float32)
+
+    cols = min(cols, batch)
+    nrows = batch // cols
     rows = []
     for _ in range(nrows):
         rows.append(torch.cat(list(y_true[:cols]), dim=1))

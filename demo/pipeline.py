@@ -8,9 +8,13 @@ from threading import Lock, Thread
 
 import numpy as np
 import torch
-from awr_api.dca_types import RadarFrame
 from beartype.typing import Any, Callable
 from jaxtyping import Float
+
+try:
+    from awr_api.dca_types import RadarFrame
+except ImportError:
+    RadarFrame = Any
 
 from deepradar import DeepRadar, transforms
 

@@ -1,0 +1,34 @@
+# RADs-like I/Q-1M radar input ablation.
+#
+# This keeps one post-FFT elevation bin and maps I/Q-1M Doppler bins into a
+# 64-bin [-90, 90] m/s physical span. Multiple source bins landing in the same
+# target bin are averaged and then lightly blurred along Doppler to better mimic
+# the low physical Doppler resolution of RADs.
+dataset:
+  channels:
+    radar:
+      args:
+        :transform:
+        - name: AssertTx2
+          args: {}
+        - name: IIQQtoIQ
+          args:
+            scale: 0.001
+        - name: FFTArray
+          args:
+            pad: 0
+            axes: [0, 1, 2, 3]
+        - name: RADsLikeDoppler
+          args:
+            target_bins: 64
+            target_max_speed: 90.0
+            # FFT-shifted lower elevation bin; verify with RADs calibration if available.
+            elevation_index: 0
+            merge: mean
+            smooth_sigma_bins: 1.25
+        - name: ComplexPhase
+          args: {}
+
+encoder:
+  args:
+    :patch: [2, 8, 1, 4]

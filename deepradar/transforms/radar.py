@@ -43,6 +43,93 @@ class RadarResolution(Transform):
         return meta
 
 
+class RADsLikeDoppler(Transform):
+    """Project post-FFT I/Q-1M cubes onto a RADs-like Doppler/elevation grid.
+
+    The input is expected after :class:`FFTArray`, in
+    time-doppler-azimuth-elevation-range order. A single elevation bin is kept,
+    and source Doppler bins are merged into a target physical velocity span.
+    """
+
+    def __init__(
+        self, path: str, target_bins: int = 64,
+        target_max_speed: float = 90.0, elevation_index: int = 0,
+        merge: str = "mean", smooth_sigma_bins: float = 0.0
+    ) -> None:
+        with open(os.path.join(path, "radar", "radar.json")) as f:
+            cfg = json.load(f)
+
+        if target_bins <= 0:
+            raise ValueError("target_bins must be positive.")
+        if target_max_speed <= 0:
+            raise ValueError("target_max_speed must be positive.")
+        if merge not in {"mean", "sum"}:
+            raise ValueError("merge must be 'mean' or 'sum'.")
+        if smooth_sigma_bins < 0:
+            raise ValueError("smooth_sigma_bins must be non-negative.")
+
+        self.source_doppler_res = float(cfg["doppler_resolution"])
+        self.target_bins = int(target_bins)
+        self.target_max_speed = float(target_max_speed)
+        self.elevation_index = int(elevation_index)
+        self.merge = merge
+        self.smooth_sigma_bins = float(smooth_sigma_bins)
+
+    def __call__(
+        self, data: Complex64[np.ndarray, "T D A E R"],
+        aug: dict[str, Any] = {}, idx: int = 0
+    ) -> Complex64[np.ndarray, "T D2 A E2 R"]:
+        if data.ndim != 5:
+            raise ValueError(
+                "RADsLikeDoppler expects [time, doppler, azimuth, "
+                "elevation, range] data.")
+
+        t, source_bins, azimuth, elevation, ranges = data.shape
+        if not 0 <= self.elevation_index < elevation:
+            raise ValueError(
+                f"elevation_index={self.elevation_index} is out of bounds "
+                f"for elevation={elevation}.")
+
+        target = np.zeros(
+            (t, self.target_bins, azimuth, 1, ranges), dtype=data.dtype)
+        counts = np.zeros(self.target_bins, dtype=np.int32)
+
+        source_velocity = (
+            np.arange(source_bins, dtype=np.float32) - source_bins // 2
+        ) * self.source_doppler_res
+        target_res = 2.0 * self.target_max_speed / self.target_bins
+        target_index = np.rint(
+            source_velocity / target_res + self.target_bins // 2
+        ).astype(np.int32)
+
+        kept = data[:, :, :, self.elevation_index:self.elevation_index + 1, :]
+        for source_idx, target_idx in enumerate(target_index):
+            if 0 <= target_idx < self.target_bins:
+                target[:, target_idx] += kept[:, source_idx]
+                counts[target_idx] += 1
+
+        if self.merge == "mean":
+            nonzero = counts > 0
+            target[:, nonzero] /= counts[nonzero][None, :, None, None, None]
+
+        if self.smooth_sigma_bins > 0:
+            radius = max(1, int(np.ceil(3.0 * self.smooth_sigma_bins)))
+            offsets = np.arange(-radius, radius + 1, dtype=np.float32)
+            kernel = np.exp(
+                -0.5 * np.square(offsets / self.smooth_sigma_bins))
+            kernel = (kernel / kernel.sum()).astype(np.float32)
+            padded = np.pad(
+                target,
+                ((0, 0), (radius, radius), (0, 0), (0, 0), (0, 0)),
+                mode="constant")
+            smoothed = np.zeros_like(target)
+            for i, weight in enumerate(kernel):
+                smoothed += weight * padded[:, i:i + self.target_bins]
+            target = smoothed
+
+        return target
+
+
 class Representation(Transform):
     """Base class for radar representations."""
 

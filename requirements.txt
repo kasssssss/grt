@@ -21,3 +21,7 @@ beartype
 types-PyYAML
 tqdm-stubs
 pandas
+# Red Rover/Ouster compatibility for I/Q-1M traces.
+# ouster-sdk 0.13.x fails to parse these Ouster metadata files.
+ouster-sdk==0.12.0
+kiss-icp==0.4.0
