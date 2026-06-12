@@ -1,0 +1,9 @@
+dataset:
+  # Full RADs-like I/Q-1M outdoor training split.
+  # Train on the first 99.8% of every configured outdoor trace and validate
+  # on the final 0.2%; this keeps train/val disjoint while using nearly all
+  # available samples.
+  ptrain: 0.998
+  pval: 0.002
+  batch_size: 4
+  val_samples: 32

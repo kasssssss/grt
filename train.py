@@ -40,6 +40,9 @@ def _parse():
     g.add_argument(
         "--epochs", default=-1, type=int, help="Maximum number of epochs.")
     g.add_argument(
+        "--max_time", default=None,
+        help="Optional Lightning max_time limit, e.g. 00:03:45:00.")
+    g.add_argument(
         "--metric", default="loss/val",
         help="Metric to watch for convergence (e.g. `loss/val`).")
     g.add_argument(
@@ -185,12 +188,16 @@ def _main(args):
     trainer = L.Trainer(
         logger=logger, log_every_n_steps=args.log_interval,
         callbacks=[checkpoint, stopping], max_steps=-1, max_epochs=args.epochs,
-        val_check_interval=args.val_interval, strategy=strategy,
+        max_time=args.max_time, val_check_interval=args.val_interval,
+        strategy=strategy,
         accelerator=accelerator, devices=devices,
         precision="16-mixed")
 
     start = time.perf_counter()
-    trainer.fit(model=model, datamodule=data)
+    fit_kwargs = {"model": model, "datamodule": data}
+    if args.checkpoint is not None:
+        fit_kwargs["ckpt_path"] = args.checkpoint
+    trainer.fit(**fit_kwargs)
     duration = time.perf_counter() - start
 
     with open(os.path.join(logger.log_dir, "meta.json"), 'w') as f:
