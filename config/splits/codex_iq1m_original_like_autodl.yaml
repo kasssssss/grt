@@ -1,0 +1,9 @@
+dataset:
+  # Match the official GRT model-selection split. Final near-full-data fitting
+  # is a separate phase after hyperparameters and stopping point are selected.
+  ptrain: 0.8
+  pval: 0.2
+  batch_size: 16
+  val_samples: 16
+  # Broad deterministic coverage across every configured validation tail.
+  val_subsample: 8192

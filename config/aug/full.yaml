@@ -9,7 +9,7 @@ dataset:
       args: {"p": 0.5}
     radar_scale:
       name: TruncatedLogNormal
-      args: {"std": 1.0, "clip": 0.0}
+      args: {"std": 0.2, "clip": 2.0}
     radar_phase:
       name: Uniform
       args: {"lower": -3.14159265, "upper": 3.14159265}

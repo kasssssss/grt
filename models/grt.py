@@ -111,6 +111,72 @@ class TransformerEncoder(L.LightningModule):
             return out
 
 
+class AzimuthFFTTransformerEncoder(TransformerEncoder):
+    """GRT encoder that preserves a dense azimuth input grid.
+
+    The precomputed RADs-like I/Q-1M cache stores the native eight-bin
+    azimuth spectrum.  Expanding that spectrum by interpolation would discard
+    phase consistency.  Instead, this encoder reconstructs the complex
+    spectrum, returns to the antenna-aperture domain, zero pads the aperture,
+    and applies the azimuth FFT again.  Inputs that already have the requested
+    azimuth size, such as a native RADs ``A=256`` tensor, pass through
+    unchanged.
+
+    This class is opt-in so existing ``TransformerEncoder`` checkpoints and
+    configurations retain their original behavior.
+
+    Args:
+        azimuth_bins: target azimuth FFT size. Must not be smaller than the
+            input spectrum.
+        kwargs: standard :class:`TransformerEncoder` arguments.
+    """
+
+    def __init__(self, azimuth_bins: int = 256, **kwargs) -> None:
+        super().__init__(**kwargs)
+        if azimuth_bins < 1:
+            raise ValueError("azimuth_bins must be positive.")
+        self.azimuth_bins = int(azimuth_bins)
+
+    def expand_azimuth(
+        self, x: Float[Tensor, "n d a e r c"]
+    ) -> Float[Tensor, "n d a2 e r c"]:
+        """Expand a ComplexPhase azimuth spectrum without losing phase."""
+        if x.ndim != 6 or x.shape[-1] != 2:
+            raise ValueError(
+                "AzimuthFFTTransformerEncoder expects [N,D,A,E,R,2], "
+                f"got {tuple(x.shape)}.")
+
+        source_bins = int(x.shape[2])
+        if source_bins == self.azimuth_bins:
+            return x
+        if source_bins > self.azimuth_bins:
+            raise ValueError(
+                f"Cannot phase-preservingly shrink A={source_bins} to "
+                f"A={self.azimuth_bins}; use an explicit reducer.")
+
+        magnitude = x[..., 0].float().square()
+        phase = x[..., 1].float()
+        spectrum = torch.polar(magnitude, phase)
+        aperture = torch.fft.ifft(
+            torch.fft.ifftshift(spectrum, dim=2), dim=2)
+        padding = torch.zeros(
+            (*aperture.shape[:2], self.azimuth_bins - source_bins,
+             *aperture.shape[3:]),
+            dtype=aperture.dtype,
+            device=aperture.device,
+        )
+        aperture = torch.cat((aperture, padding), dim=2)
+        expanded = torch.fft.fftshift(
+            torch.fft.fft(aperture, dim=2), dim=2)
+        return torch.stack(
+            (torch.sqrt(torch.abs(expanded)), torch.angle(expanded)), dim=-1)
+
+    def forward(
+        self, x: Float[Tensor, "n d a e r c"]
+    ) -> Float[Tensor, "n s c"] | list[Float[Tensor, "n s c"]]:
+        return super().forward(self.expand_azimuth(x))
+
+
 class TransformerDecoder(L.LightningModule):
     """Radar transformer tensor decoder.
 
@@ -201,6 +267,74 @@ class TransformerDecoder(L.LightningModule):
             out = out[..., 0]
 
         return {self.key: out}
+
+
+class ResidualRefinedTransformerDecoder(TransformerDecoder):
+    """Transformer decoder with an opt-in local 3D residual refiner.
+
+    The standard GRT unpatch projection predicts each output patch without a
+    local operation spanning neighboring patch boundaries.  This lightweight
+    depthwise-convolutional block operates on the reconstructed polar volume
+    and can therefore repair boundary discontinuities without increasing the
+    transformer token count.  Its final projection is zero-initialized, so a
+    converted checkpoint initially produces exactly the baseline decoder
+    output.
+
+    Args:
+        refine_dim: hidden width of the local refiner.
+        refine_kernel: odd spatial kernel size for elevation, azimuth, and
+            range mixing.
+        kwargs: standard :class:`TransformerDecoder` arguments.  The output
+            shape must be three-dimensional.
+    """
+
+    def __init__(
+        self, refine_dim: int = 8, refine_kernel: int = 3, **kwargs
+    ) -> None:
+        shape = kwargs.get("shape", (1024, 256))
+        if len(shape) != 3:
+            raise ValueError(
+                "ResidualRefinedTransformerDecoder requires a 3D output "
+                f"shape, got {shape}.")
+        if refine_dim < 1:
+            raise ValueError("refine_dim must be positive.")
+        if refine_kernel < 1 or refine_kernel % 2 == 0:
+            raise ValueError("refine_kernel must be a positive odd integer.")
+
+        super().__init__(**kwargs)
+        channels = max(1, self.out_dim)
+        padding = refine_kernel // 2
+        self.refiner = nn.Sequential(
+            nn.Conv3d(channels, refine_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Conv3d(
+                refine_dim,
+                refine_dim,
+                kernel_size=refine_kernel,
+                padding=padding,
+                groups=refine_dim,
+            ),
+            nn.GELU(),
+            nn.Conv3d(refine_dim, channels, kernel_size=1),
+        )
+        nn.init.zeros_(self.refiner[-1].weight)
+        nn.init.zeros_(self.refiner[-1].bias)
+
+    def forward(
+        self, encoded: Float[Tensor, "n s c"]
+    ) -> dict[str, Float[Tensor, "n h w d ..."]]:
+        decoded = super().forward(encoded)
+        value = decoded[self.key]
+        channels_first = (
+            value.unsqueeze(1) if self.out_dim == 0
+            else value.movedim(-1, 1)
+        )
+        refined = channels_first + self.refiner(channels_first)
+        decoded[self.key] = (
+            refined[:, 0] if self.out_dim == 0
+            else refined.movedim(1, -1)
+        )
+        return decoded
 
 
 class VectorDecoder(L.LightningModule):

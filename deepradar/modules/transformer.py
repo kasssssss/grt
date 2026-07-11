@@ -184,7 +184,7 @@ class BasisChange(nn.Module):
         """
         idxs = [slice(None)] + [None] * len(self.shape) + [slice(None)]
         query = self.pos(
-            torch.tile(x[idxs], (1, *self.shape, 1)))
+            torch.tile(x[tuple(idxs)], (1, *self.shape, 1)))
 
         if self.flatten:
             query = query.reshape(x.shape[0], -1, x.shape[-1])

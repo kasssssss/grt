@@ -1,0 +1,15 @@
+# Use precomputed RADs-like I/Q-1M radar tensors instead of recomputing the
+# raw IQ -> FFT -> RADsLikeDoppler -> ComplexPhase chain online.
+dataset:
+  channels:
+    radar:
+      name: PrecomputedRadarChannel
+      indices: radar
+      :args:
+        cache_root: /root/autodl-tmp/data/iq1m_radslike_precomputed_single_elev_f16_v1
+        sensor: radar
+        index_file: _fusion/indices.npz
+        lru_size: 8
+        transform:
+        - name: PrecomputedComplexPhaseAugment
+          args: {}

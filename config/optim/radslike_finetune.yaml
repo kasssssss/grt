@@ -1,0 +1,8 @@
+# Conservative fine tuning from a fully loaded official task checkpoint.
+optimizer:
+  name: AdamW
+  default_lr: 0.00001
+  warmup: 250
+  subsets:
+    "^decoder\\.":
+      lr: 0.000005

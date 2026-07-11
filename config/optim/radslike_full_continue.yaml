@@ -1,0 +1,8 @@
+# Conservative optimizer for a complete-dataloader continuation from the
+# selected A256/E1 checkpoint. This is intentionally lower than the 1e-4
+# model-selection learning rate.
+optimizer:
+  name: AdamW
+  default_lr: 0.00002
+  warmup: 250
+  subsets: {}

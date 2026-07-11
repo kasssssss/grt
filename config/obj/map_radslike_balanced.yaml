@@ -1,8 +1,10 @@
+# RADs-like I/Q-1M occupancy objective. Keep the official output geometry,
+# but avoid the positive-class over-weighting that produces filled BEV fans.
 objectives:
 - name: PolarOccupancy
   args:
     weight: 1.0
-    positive_weight: 64.0
+    positive_weight: 16.0
     max_range: 64.0
     el_span: 0.7853981633974483
     az_span: 1.5707963267948966
@@ -21,16 +23,11 @@ dataset:
           args: {}
         - name: Map3D
           args:
-            # (elevation, azimuth, range): (128, 2048, 256)
-            # -> crop(0, 0.25, 0) -> (128, 1024, 256)
-            # -> decimate(2, 8, 4) -> (64, 128, 64) ~ 0.52MP
-            # Comparable to radar input, which is 64 * 8 * 2 * 256 ~ 0.26MP
             decimate: [2, 8, 4]
             crop_az: 0.25
 
 decoder:
   args:
-    # Canonical axes: elevation-azimuth-range
     key: map
     pos_scale: [1.0, 1.0, 1.0]
     shape: [64, 128, 64]

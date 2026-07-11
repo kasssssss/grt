@@ -1,0 +1,6 @@
+# Conservative decoder-only adaptation from the A256 F1-best checkpoint.
+optimizer:
+  name: AdamW
+  default_lr: 0.00002
+  warmup: 50
+  subsets: {}

@@ -1,0 +1,29 @@
+objectives:
+- name: Segmentation
+  args:
+    weight: 1.0
+
+dataset:
+  channels:
+    segment:
+      name: RawChannel
+      # I/Q-1M fusion indices contain radar/lidar only. The _camera/segment
+      # stream is the camera-derived label aligned to lidar frames, so use the
+      # lidar column to index the segment channel.
+      indices: lidar
+      args:
+        sensor: _camera
+        channel: segment
+        transform:
+        - name: CameraAugmentations
+          args: {}
+
+decoder:
+  args:
+    # Canonical axes: elevation-azimuth-range
+    # 120 deg / 180 deg azimuth crop; no elevation crop
+    key: segment
+    pos_scale: [1.0, 0.666, 1.0]
+    shape: [160, 160, 1]
+    patch: [5, 5, 1]
+    out_dim: 8

@@ -4,12 +4,12 @@ import json
 import os
 
 import numpy as np
-import roverd
 import torch
 from beartype.typing import Any, Optional
 from jaxtyping import Bool, Complex64, Float32
 from torchvision import transforms
 
+from deepradar._compat import roverd
 from .base import Transform
 
 
@@ -47,14 +47,16 @@ class RADsLikeDoppler(Transform):
     """Project post-FFT I/Q-1M cubes onto a RADs-like Doppler/elevation grid.
 
     The input is expected after :class:`FFTArray`, in
-    time-doppler-azimuth-elevation-range order. A single elevation bin is kept,
-    and source Doppler bins are merged into a target physical velocity span.
+    time-doppler-azimuth-elevation-range order. The selected elevation bin(s)
+    are kept, and source Doppler bins are merged into a target physical
+    velocity span.
     """
 
     def __init__(
         self, path: str, target_bins: int = 64,
-        target_max_speed: float = 90.0, elevation_index: int = 0,
-        merge: str = "mean", smooth_sigma_bins: float = 0.0
+        target_max_speed: float = 90.0, elevation_index: Optional[int] = None,
+        elevation_indices: Optional[list[int]] = None, merge: str = "mean",
+        smooth_sigma_bins: float = 0.0
     ) -> None:
         with open(os.path.join(path, "radar", "radar.json")) as f:
             cfg = json.load(f)
@@ -71,7 +73,14 @@ class RADsLikeDoppler(Transform):
         self.source_doppler_res = float(cfg["doppler_resolution"])
         self.target_bins = int(target_bins)
         self.target_max_speed = float(target_max_speed)
-        self.elevation_index = int(elevation_index)
+        if elevation_indices is not None:
+            if len(elevation_indices) == 0:
+                raise ValueError("elevation_indices must not be empty.")
+            self.elevation_indices = tuple(int(i) for i in elevation_indices)
+        elif elevation_index is not None:
+            self.elevation_indices = (int(elevation_index),)
+        else:
+            self.elevation_indices = None
         self.merge = merge
         self.smooth_sigma_bins = float(smooth_sigma_bins)
 
@@ -85,13 +94,19 @@ class RADsLikeDoppler(Transform):
                 "elevation, range] data.")
 
         t, source_bins, azimuth, elevation, ranges = data.shape
-        if not 0 <= self.elevation_index < elevation:
-            raise ValueError(
-                f"elevation_index={self.elevation_index} is out of bounds "
-                f"for elevation={elevation}.")
+        if self.elevation_indices is None:
+            elevation_indices = tuple(range(elevation))
+        else:
+            elevation_indices = self.elevation_indices
+        for elevation_index in elevation_indices:
+            if not 0 <= elevation_index < elevation:
+                raise ValueError(
+                    f"elevation_index={elevation_index} is out of bounds "
+                    f"for elevation={elevation}.")
 
         target = np.zeros(
-            (t, self.target_bins, azimuth, 1, ranges), dtype=data.dtype)
+            (t, self.target_bins, azimuth, len(elevation_indices), ranges),
+            dtype=data.dtype)
         counts = np.zeros(self.target_bins, dtype=np.int32)
 
         source_velocity = (
@@ -102,7 +117,7 @@ class RADsLikeDoppler(Transform):
             source_velocity / target_res + self.target_bins // 2
         ).astype(np.int32)
 
-        kept = data[:, :, :, self.elevation_index:self.elevation_index + 1, :]
+        kept = data[:, :, :, list(elevation_indices), :]
         for source_idx, target_idx in enumerate(target_index):
             if 0 <= target_idx < self.target_bins:
                 target[:, target_idx] += kept[:, source_idx]
@@ -317,6 +332,53 @@ class ComplexPhase(Representation):
             stretched_magnitude * aug.get("radar_scale", 1.0),
             _normalize(stretched_phase + aug.get("radar_phase", 0.0))
         ], axis=-1)
+
+
+class PrecomputedComplexPhaseAugment(Transform):
+    """Apply official radar augmentations to cached ComplexPhase tensors.
+
+    Precomputed RADs-like samples have shape ``[D, A, E, R, 2]`` with
+    magnitude and phase in the final axis. The raw-IQ transforms cannot be
+    replayed after caching, so this transform applies the equivalent flips,
+    scale/phase shifts, and range/Doppler resizing directly to that
+    representation. It must be paired with the same augmentation dictionary
+    used by lidar/camera targets so spatial labels stay aligned.
+    """
+
+    def __init__(self, path: str) -> None:
+        del path
+
+    def __call__(
+        self, data: Float32[np.ndarray, "D A E R C"],
+        aug: dict[str, Any] = {}, idx: int = 0
+    ) -> Float32[np.ndarray, "D A E R C"]:
+        del idx
+        data = np.asarray(data, dtype=np.float32)
+        if data.ndim != 5 or data.shape[-1] != 2:
+            raise ValueError(
+                "PrecomputedComplexPhaseAugment expects [D,A,E,R,2], "
+                f"got {tuple(data.shape)}.")
+        if not aug:
+            return data
+
+        magnitude = data[..., 0]
+        phase = data[..., 1]
+        magnitude = Representation._augment(magnitude[None], aug=aug)[0]
+        phase = Representation._augment(phase[None], aug=aug)[0]
+
+        if aug.get("azimuth_flip"):
+            magnitude = np.flip(magnitude, axis=1)
+            phase = np.flip(phase, axis=1)
+        if aug.get("doppler_flip"):
+            magnitude = np.flip(magnitude, axis=0)
+            phase = np.flip(phase, axis=0)
+
+        magnitude = magnitude * aug.get("radar_scale", 1.0)
+        phase = (
+            phase + aug.get("radar_phase", 0.0) + np.pi
+        ) % (2 * np.pi) - np.pi
+        return np.ascontiguousarray(
+            np.stack((magnitude, phase), axis=-1), dtype=np.float32)
 
 
 class AmplitudeAOA(Representation):

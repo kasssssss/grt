@@ -2,10 +2,14 @@
 
 import numpy as np
 import torch
-from beartype.typing import Any
+from beartype.typing import Any, Sequence
 from jaxtyping import Bool, Float, Shaped
 from torch import Tensor
-from torch.nn.functional import binary_cross_entropy_with_logits
+from torch.nn.functional import (
+    binary_cross_entropy_with_logits,
+    max_pool3d,
+    smooth_l1_loss,
+)
 
 from deepradar.utils import comparison_grid, polar3_to_bev
 
@@ -87,7 +91,10 @@ class PolarOccupancy(Objective):
         positive_weight: float = 64.0, focal_loss: float = 0.0,
         max_range: float = 64.0,
         el_span: float = np.pi / 4, az_span: float = np.pi / 2,
-        cmap_bev: str = 'inferno', cmap_depth: str = 'viridis'
+        cmap_bev: str = 'inferno', cmap_depth: str = 'viridis',
+        seam_weight: float = 0.0,
+        seam_patch: Sequence[int] = (8, 8, 8),
+        seam_context_radius: int = 2,
     ) -> None:
         self.weight = weight
         self.range_weighted = range_weighted
@@ -95,9 +102,26 @@ class PolarOccupancy(Objective):
         self.cmap_bev = cmap_bev
         self.cmap_depth = cmap_depth
         self.focal_loss = focal_loss
+        self.seam_weight = float(seam_weight)
+        self.seam_patch = tuple(int(value) for value in seam_patch)
+        self.seam_context_radius = int(seam_context_radius)
+        if len(self.seam_patch) != 3 or any(value < 1 for value in self.seam_patch):
+            raise ValueError("seam_patch must contain three positive values.")
+        if self.seam_context_radius < 0:
+            raise ValueError("seam_context_radius must be non-negative.")
 
         self.chamfer = PolarChamfer(
             az_span=az_span, el_span=el_span, max_range=max_range)
+
+    @staticmethod
+    def _first_hit(
+        occupancy: Bool[Tensor, "batch el az rng"]
+    ) -> tuple[Float[Tensor, "batch el az"], Bool[Tensor, "batch el az"]]:
+        """Return one-based first-hit range and a separate validity mask."""
+        valid = torch.any(occupancy, dim=-1)
+        depth = torch.argmax(
+            occupancy.to(torch.uint8), dim=-1).to(torch.float32) + 1.0
+        return torch.where(valid, depth, 0.0), valid
 
     def bce_loss(
         self, y_true: Bool[Tensor, "batch el az rng"],
@@ -126,43 +150,112 @@ class PolarOccupancy(Objective):
 
         return torch.mean(loss) if reduce else loss
 
+    def seam_loss(
+        self, y_true: Bool[Tensor, "batch el az rng"],
+        y_hat: Float[Tensor, "batch el az rng"], reduce: bool = True,
+    ) -> Float[Tensor, "*#batch"]:
+        """Penalize discontinuities across decoder patches near GT surfaces.
+
+        Pairs with different labels are excluded so real occupancy boundaries
+        remain sharp. Empty pairs are considered only when either side is near
+        a positive target voxel, preventing the vast empty volume from
+        dominating the regularizer.
+        """
+        if self.seam_weight == 0.0:
+            zero = y_hat.new_zeros(y_hat.shape[0])
+            return zero.mean() if reduce else zero
+
+        radius = self.seam_context_radius
+        if radius == 0:
+            context = y_true
+        else:
+            kernel = 2 * radius + 1
+            context = max_pool3d(
+                y_true.to(y_hat.dtype).unsqueeze(1),
+                kernel_size=kernel,
+                stride=1,
+                padding=radius,
+            )[:, 0] > 0
+
+        batch_losses = []
+        for axis, patch in enumerate(self.seam_patch, start=1):
+            boundary = torch.arange(
+                patch, y_hat.shape[axis], patch, device=y_hat.device)
+            if boundary.numel() == 0:
+                continue
+            left_index = boundary - 1
+            left_hat = torch.index_select(y_hat, axis, left_index)
+            right_hat = torch.index_select(y_hat, axis, boundary)
+            left_true = torch.index_select(y_true, axis, left_index)
+            right_true = torch.index_select(y_true, axis, boundary)
+            left_context = torch.index_select(context, axis, left_index)
+            right_context = torch.index_select(context, axis, boundary)
+            mask = (left_true == right_true) & (left_context | right_context)
+            pair_loss = smooth_l1_loss(
+                left_hat, right_hat, reduction="none") * mask.to(y_hat.dtype)
+            dims = tuple(range(1, pair_loss.ndim))
+            batch_losses.append(
+                pair_loss.sum(dim=dims)
+                / mask.sum(dim=dims).clamp_min(1).to(y_hat.dtype))
+
+        if not batch_losses:
+            result = y_hat.new_zeros(y_hat.shape[0])
+        else:
+            result = torch.stack(batch_losses, dim=0).mean(dim=0)
+        return result.mean() if reduce else result
+
     def metrics(
         self, y_true: dict[str, Shaped[Tensor, "..."]],
         y_hat: dict[str, Shaped[Tensor, "..."]],
         reduce: bool = True, train: bool = True
     ) -> Metrics:
         """Get training metrics."""
-        loss = self.bce_loss(y_true['map'], y_hat['map'], reduce=reduce)
+        bce = self.bce_loss(y_true['map'], y_hat['map'], reduce=reduce)
+        seam = self.seam_loss(y_true['map'], y_hat['map'], reduce=reduce)
+        loss = bce + self.seam_weight * seam
         if train:
-            return Metrics(loss=self.weight * loss, metrics={"map_loss": loss})
+            return Metrics(
+                loss=self.weight * loss,
+                metrics={"map_loss": bce, "map_seam": seam},
+            )
         else:
-            y_hat_occ = y_hat["map"] > 0
-            depth_hat = torch.argmax(
-                y_hat_occ.to(torch.uint8), dim=-1).to(torch.float32)
-            depth_true = torch.argmax(
-                y_true["map"].to(torch.uint8), dim=-1).to(torch.float32)
-
-            return Metrics(loss=self.weight * loss, metrics={
-                "map_loss": loss,
-                "map_depth": LPObjective(
-                    ord=1, mask=0)(depth_hat, depth_true, reduce=reduce),
-                "map_chamfer": self.chamfer(
-                    depth_true, depth_hat, reduce=reduce),
-                **accuracy_metrics(
-                    y_hat_occ, y_true["map"], prefix="map_", reduce=reduce)
-            })
+            depth_true, _ = self._first_hit(y_true["map"])
+            metrics = {
+                "map_loss": bce,
+                "map_seam": seam,
+            }
+            for label, threshold in (("m1", -1.0), ("0", 0.0), ("p1", 1.0)):
+                y_hat_occ = y_hat["map"] > threshold
+                depth_hat, valid_hat = self._first_hit(y_hat_occ)
+                metrics[f"map_depth_{label}"] = LPObjective(
+                    ord=1, mask=0)(depth_hat, depth_true, reduce=reduce)
+                invalid = torch.mean(
+                    (~valid_hat).to(torch.float32), dim=(1, 2))
+                metrics[f"map_invalid_{label}"] = (
+                    torch.mean(invalid) if reduce else invalid)
+                metrics.update(accuracy_metrics(
+                    y_hat_occ, y_true["map"],
+                    prefix=f"map_{label}_", reduce=reduce))
+                if threshold == 0.0:
+                    metrics["map_depth"] = metrics[f"map_depth_{label}"]
+                    metrics["map_chamfer"] = self.chamfer(
+                        depth_true, depth_hat, reduce=reduce)
+                    metrics.update(accuracy_metrics(
+                        y_hat_occ, y_true["map"],
+                        prefix="map_", reduce=reduce))
+            return Metrics(loss=self.weight * loss, metrics=metrics)
 
     def visualizations(
         self, y_true: dict[str, Shaped[Tensor, "..."]],
         y_hat: dict[str, Shaped[Tensor, "..."]]
     ) -> dict[str, Shaped[np.ndarray, "H W 3"]]:
         """Generate visualizations."""
-        depth = torch.argmax(y_true['map'].to(torch.uint8), dim=-1)
+        depth, _ = self._first_hit(y_true['map'])
         bev = polar3_to_bev(y_true['map'], mode='highest')
         bev[bev == 0] = torch.min(bev) - 2
 
         map_pred = y_hat['map'] > 0
-        depth_hat = torch.argmax(map_pred.to(torch.uint8), dim=-1)
+        depth_hat, _ = self._first_hit(map_pred)
         bev_hat = polar3_to_bev(map_pred, mode="highest")
         bev_hat[bev_hat == 0] = torch.min(bev_hat) - 2
 
@@ -170,8 +263,10 @@ class PolarOccupancy(Objective):
             "bev": comparison_grid(
                 bev, bev_hat, cmap=self.cmap_bev, cols=8, normalize=True),
             "depth": comparison_grid(
-                depth, depth_hat, cmap=self.cmap_depth, cols=8,
-                normalize=True)}
+                depth / y_true['map'].shape[-1],
+                depth_hat / y_true['map'].shape[-1],
+                cmap=self.cmap_depth, cols=8, normalize=False,
+                invalid_zero_black=True)}
 
     RENDER_CHANNELS: dict[str, dict[str, Any]] = {
         "bev": {
@@ -210,12 +305,11 @@ class PolarOccupancy(Objective):
         map_pred = y_hat['map'] > 0
         raw = {
             "bev": 255 - polar3_to_bev(map_pred, mode="highest"),
-            "depth": torch.argmax(map_pred.to(torch.uint8), dim=-1)
+            "depth": self._first_hit(map_pred)[0]
         }
 
         if gt:
             raw['bev_gt'] = 255 - polar3_to_bev(y_true['map'], mode='highest')
-            raw['depth_gt'] = torch.argmax(
-                y_true['map'].to(torch.uint8), dim=-1)
+            raw['depth_gt'] = self._first_hit(y_true['map'])[0]
 
         return {k: v.to(torch.uint8).cpu().numpy() for k, v in raw.items()}

@@ -1,0 +1,21 @@
+# Phase-preserving pseudo-A256 input plus a local polar-volume refiner.
+#
+# This is an opt-in ablation. The A8 -> A256 expansion and transformer token
+# geometry are identical to rads_like_a256.yaml. Only the decoder gains a
+# zero-initialized residual 3D convolution after unpatching, so loading an A256
+# baseline checkpoint initially preserves its exact predictions.
+
+encoder:
+  :name: AzimuthFFTTransformerEncoder
+  args:
+    :patch: [8, 32, 1, 8]
+    azimuth_bins: 256
+
+decoder:
+  :name: ResidualRefinedTransformerDecoder
+  args:
+    refine_dim: 8
+    refine_kernel: 3
+
+dataset:
+  batch_size: 24

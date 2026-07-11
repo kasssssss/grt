@@ -65,7 +65,7 @@ import numpy as np
 import torch
 from beartype.typing import Any, Callable, Iterable, Optional
 from jaxtyping import Shaped
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 from . import augmentations as mod_augmentations
 from . import channels as mod_channels
@@ -73,6 +73,39 @@ from .channels import Index
 
 #: Augmentation spec generator type
 Augmentation = Callable[[], Any]
+
+_PRECOMPUTED_RADAR_AUGMENTATIONS = {
+    "azimuth_flip",
+    "doppler_flip",
+    "radar_scale",
+    "radar_phase",
+    "range_scale",
+    "speed_scale",
+}
+
+
+def _validate_precomputed_augmentations(
+    channels: dict[str, dict], augmentations: dict[str, dict]
+) -> None:
+    """Reject augmentations that cannot reach a precomputed radar tensor."""
+    active = sorted(
+        set(augmentations).intersection(_PRECOMPUTED_RADAR_AUGMENTATIONS))
+    if not active:
+        return
+
+    untransformed = [
+        name for name, spec in channels.items()
+        if spec.get("name") == "PrecomputedRadarChannel"
+        and not spec.get("args", {}).get("transform")
+    ]
+    if untransformed:
+        raise ValueError(
+            "PrecomputedRadarChannel cannot use radar/geometric augmentations "
+            "without a post-cache transform. The radar input would remain "
+            "unchanged while target transforms may consume the same "
+            "augmentation values. Disable these augmentations or implement a "
+            f"matched post-cache transform. channels={untransformed}, "
+            f"augmentations={active}")
 
 
 class RoverTrace:
@@ -228,6 +261,7 @@ class RoverDataModule(L.LightningDataModule):
         self, path: str, traces: list[str] = [], mask: Optional[str] = None,
         pval: float = 0.2, ptrain: Optional[float] = None,
         batch_size: int = 64, val_samples: int | Iterable[int] = 16,
+        val_subsample: Optional[int] = None,
         channels: dict[str, dict] = {},
         augmentations: dict[str, dict] = {}, n_workers: Optional[int] = None
     ) -> None:
@@ -238,6 +272,7 @@ class RoverDataModule(L.LightningDataModule):
         self.pval = pval
         self.ptrain = (1 - pval if ptrain is None else ptrain)
 
+        _validate_precomputed_augmentations(channels, augmentations)
         self._augmentations = {
             k: getattr(mod_augmentations, v["name"])(**v["args"])
             for k, v in augmentations.items()}
@@ -258,6 +293,9 @@ class RoverDataModule(L.LightningDataModule):
             self.nproc = n_workers
 
         self._val_samples = val_samples
+        self.val_subsample = val_subsample
+        if self.val_subsample is not None and self.val_subsample <= 0:
+            raise ValueError("val_subsample must be positive when specified.")
 
     def train_dataloader(self) -> DataLoader:
         """Get train dataloader (lightning API).
@@ -281,8 +319,15 @@ class RoverDataModule(L.LightningDataModule):
         ds = RoverData(
             self._paths, channels=self._channels, mask=self.mask,
             augmentations={}, bounds=(1.0 - self.pval, 1.0))
+        if self.val_subsample is not None and len(ds) > self.val_subsample:
+            # Deterministic, broad coverage over the concatenated validation
+            # pool. Unlike limit_val_batches, this does not repeatedly select
+            # only the first traces.
+            indices = np.linspace(
+                0, len(ds) - 1, self.val_subsample, dtype=np.int64)
+            ds = Subset(ds, indices.tolist())
         return DataLoader(
-            ds, batch_size=self.batch_size, shuffle=False, drop_last=True,
+            ds, batch_size=self.batch_size, shuffle=False, drop_last=False,
             num_workers=self.nproc, pin_memory=True)
 
     def eval_dataloader(self, path: str, batch_size: int = 16) -> DataLoader:

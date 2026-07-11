@@ -1,0 +1,34 @@
+objectives:
+- name: Segmentation
+  args:
+    weight: 1.0
+    # RADs-like I/Q-1M semantic labels are strongly class-imbalanced. These
+    # moderate inverse-frequency weights keep the model from collapsing to the
+    # common road/structure/sky template without over-amplifying tiny classes.
+    class_weights: [2.611, 0.348, 0.425, 0.943, 1.852, 0.585, 0.396, 0.839]
+    focal_gamma: 1.5
+
+dataset:
+  channels:
+    segment:
+      name: RawChannel
+      # I/Q-1M fusion indices contain radar/lidar only. The _camera/segment
+      # stream is the camera-derived label aligned to lidar frames, so use the
+      # lidar column to index the segment channel.
+      indices: lidar
+      args:
+        sensor: _camera
+        channel: segment
+        transform:
+        - name: CameraAugmentations
+          args: {}
+
+decoder:
+  args:
+    # Canonical axes: elevation-azimuth-range
+    # 120 deg / 180 deg azimuth crop; no elevation crop
+    key: segment
+    pos_scale: [1.0, 0.666, 1.0]
+    shape: [160, 160, 1]
+    patch: [5, 5, 1]
+    out_dim: 8

@@ -69,12 +69,15 @@ class Sinusoid(nn.Module):
             # pos[2 * i] = sin(w * t)
             x_sin_slice = [slice(None)] * len(x.shape)
             x_sin_slice[-1] = slice(start_dim, start_dim + c * 2, 2)
-            x[x_sin_slice] = x[x_sin_slice] + torch.sin(wt)[p_slice]
+            x_sin_idx = tuple(x_sin_slice)
+            p_idx = tuple(p_slice)
+            x[x_sin_idx] = x[x_sin_idx] + torch.sin(wt)[p_idx]
 
             # pos[2 * i + 1] = cos(w * t)
             x_cos_slice = [slice(None)] * len(x.shape)
             x_cos_slice[-1] = slice(start_dim + 1, start_dim + c * 2 + 1, 2)
-            x[x_cos_slice] = x[x_cos_slice] + torch.cos(wt)[p_slice]
+            x_cos_idx = tuple(x_cos_slice)
+            x[x_cos_idx] = x[x_cos_idx] + torch.cos(wt)[p_idx]
 
             start_dim += c * 2
 

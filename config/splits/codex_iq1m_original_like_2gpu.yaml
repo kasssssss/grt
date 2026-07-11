@@ -1,0 +1,6 @@
+dataset:
+  # Match the original GRT-style training scale more closely:
+  # default ptrain = 1 - pval = 0.9, batch_size = 32, val on the last 10%.
+  pval: 0.1
+  batch_size: 32
+  val_samples: 16

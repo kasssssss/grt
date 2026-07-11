@@ -124,7 +124,8 @@ def _normalize(data: Shaped[Tensor, "..."]) -> Float[Tensor, "..."]:
 
 def comparison_grid(
     y_true: Shaped[Tensor, "batch h w"], y_hat: Shaped[Tensor, "batch h w"],
-    cols: int = 8, cmap: str = 'viridis', normalize: bool = False
+    cols: int = 8, cmap: str = 'viridis', normalize: bool = False,
+    invalid_zero_black: bool = False,
 ) -> Num[np.ndarray, "h2 w2 3"]:
     """Create image comparison grid.
 
@@ -161,4 +162,7 @@ def comparison_grid(
         y_true = y_true[cols:]
         y_hat = y_hat[cols:]
     grid = torch.cat(rows, dim=0).cpu().numpy()
-    return matplotlib.colormaps[cmap](grid)[..., :3]
+    rgb = matplotlib.colormaps[cmap](grid)[..., :3]
+    if invalid_zero_black:
+        rgb[grid == 0] = 0.0
+    return rgb

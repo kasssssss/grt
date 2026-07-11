@@ -25,13 +25,19 @@ class Destagger(Transform):
 
     def __init__(self, path: str) -> None:
         # ouster-sdk is a naughty, noisy library
-        # it is in fact so noisy, that we have cut it off at the os level...
+        # it is in fact so noisy, that we silence it at the OS level. Keep fd 1
+        # valid and restore it in a finally block so metadata errors do not
+        # corrupt stdout for every subsequent trace.
         stdout = os.dup(1)
-        os.close(1)
-        with open(os.path.join(path, "lidar", "lidar.json")) as f:
-            self.metadata = client.SensorInfo(f.read())  # type: ignore
-        os.dup2(stdout, 1)
-        os.close(stdout)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, 1)
+            with open(os.path.join(path, "lidar", "lidar.json")) as f:
+                self.metadata = client.SensorInfo(f.read())  # type: ignore
+        finally:
+            os.dup2(stdout, 1)
+            os.close(stdout)
+            os.close(devnull)
 
     def __call__(
         self, data: UInt[np.ndarray, "T El Az"], aug: dict[str, Any] = {},

@@ -9,7 +9,7 @@ import numpy as np
 
 from jaxtyping import Float64
 
-from roverd.channels import Channel, CHANNEL_TYPES
+from ..channels import Channel, CHANNEL_TYPES
 from ._timestamps import smooth_timestamps
 
 

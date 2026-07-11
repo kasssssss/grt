@@ -1,0 +1,8 @@
+# The single-elevation/RADs-like representation requires meaningful
+# adaptation from the official two-elevation checkpoint. This reproduces the
+# learning-rate regime that previously reached substantially better F1.
+optimizer:
+  name: AdamW
+  default_lr: 0.0001
+  warmup: 100
+  subsets: {}

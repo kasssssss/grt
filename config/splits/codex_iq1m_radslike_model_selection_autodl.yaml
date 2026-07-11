@@ -1,0 +1,9 @@
+dataset:
+  # Hold out the final 10% of every trace, matching the intended GRT-style
+  # model-selection protocol while retaining 90% for adaptation.
+  ptrain: 0.9
+  pval: 0.1
+  batch_size: 16
+  val_samples: 16
+  # Deterministic samples spread across the complete concatenated val pool.
+  val_subsample: 2048

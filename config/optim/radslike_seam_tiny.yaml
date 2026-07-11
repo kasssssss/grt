@@ -1,0 +1,5 @@
+optimizer:
+  name: AdamW
+  default_lr: 0.000005
+  warmup: 50
+  subsets: {}

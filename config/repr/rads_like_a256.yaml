@@ -1,0 +1,17 @@
+# Phase-preserving pseudo-A256 input for the RADs transfer experiment.
+#
+# The on-disk cache remains the native I/Q-1M [D=64,A=8,E=1,R=256,C=2]
+# ComplexPhase representation. The encoder reconstructs its complex spectrum,
+# returns to the eight-element aperture, zero pads that aperture, and performs
+# a 256-bin azimuth FFT online. This is mathematically equivalent to computing
+# the zero-padded A256 FFT from raw IQ and avoids a roughly 10.4 TB cache.
+# Inputs already shaped [64,256,1,256,2], including RADs, pass through unchanged.
+
+encoder:
+  :name: AzimuthFFTTransformerEncoder
+  args:
+    :patch: [8, 32, 1, 8]
+    azimuth_bins: 256
+
+dataset:
+  batch_size: 32

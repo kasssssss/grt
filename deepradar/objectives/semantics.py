@@ -29,10 +29,17 @@ class Segmentation(Objective):
     - `seg_miou`: segmentation Mean Intersection-Over-Union.
     """
 
-    def __init__(self, weight: float = 1.0, cmap: str = 'tab10') -> None:
+    def __init__(
+        self, weight: float = 1.0, cmap: str = 'tab10',
+        class_weights: list[float] | None = None,
+        focal_gamma: float = 0.0,
+    ) -> None:
         self.weight = weight
         self.cmap = cmap
-        self.ce = torch.nn.CrossEntropyLoss(reduction='none')
+        self.class_weights = class_weights
+        self.focal_gamma = float(focal_gamma)
+        if self.focal_gamma < 0:
+            raise ValueError("focal_gamma must be non-negative.")
 
     @staticmethod
     def miou(
@@ -42,9 +49,13 @@ class Segmentation(Objective):
         """Compute Intersection over Union for the given class labels."""
         y_true_onehot = torch.nn.functional.one_hot(y_true, num_classes=nc)
         y_hat_onehot = torch.nn.functional.one_hot(y_hat, num_classes=nc)
-        intersection = torch.sum(y_true_onehot & y_hat_onehot, dim=(2, 3))
-        union = torch.sum(y_true_onehot | y_hat_onehot, dim=(2, 3))
-        return torch.mean(intersection / union, dim=1)
+        # one_hot tensors are [batch, height, width, class]. Reduce only the
+        # spatial dimensions and exclude classes absent from both maps.
+        intersection = torch.sum(y_true_onehot & y_hat_onehot, dim=(1, 2))
+        union = torch.sum(y_true_onehot | y_hat_onehot, dim=(1, 2))
+        present = union > 0
+        iou = intersection.to(torch.float32) / union.clamp_min(1)
+        return torch.sum(iou * present, dim=1) / present.sum(dim=1).clamp_min(1)
 
     def metrics(
         self, y_true: dict[str, Shaped[Tensor, "..."]],
@@ -58,7 +69,20 @@ class Segmentation(Objective):
 
         y_true_idx: Integer[Tensor, "b h w"] = y_true["segment"].to(torch.long)
 
-        loss = torch.mean(self.ce(y_hat_logits, y_true_idx), dim=(1, 2))
+        class_weights = None
+        if self.class_weights is not None:
+            if len(self.class_weights) != y_hat_logits.shape[1]:
+                raise ValueError(
+                    f"Expected {y_hat_logits.shape[1]} semantic class weights, "
+                    f"got {len(self.class_weights)}.")
+            class_weights = y_hat_logits.new_tensor(self.class_weights)
+        ce = torch.nn.functional.cross_entropy(
+            y_hat_logits, y_true_idx, reduction='none')
+        if self.focal_gamma > 0:
+            ce = torch.pow(1.0 - torch.exp(-ce), self.focal_gamma) * ce
+        if class_weights is not None:
+            ce = ce * class_weights[y_true_idx]
+        loss = torch.mean(ce, dim=(1, 2))
         if reduce:
             loss = torch.mean(loss)
 
@@ -74,6 +98,11 @@ class Segmentation(Objective):
                 ).to(torch.float32), dim=(1, 2)),
                 "seg_miou": self.miou(y_true_idx, top2[:, 0], nc=nc)
             }
+            for cls in range(nc):
+                metrics[f"seg_pred_frac_{cls}"] = torch.mean(
+                    (top2[:, 0] == cls).to(torch.float32), dim=(1, 2))
+                metrics[f"seg_true_frac_{cls}"] = torch.mean(
+                    (y_true_idx == cls).to(torch.float32), dim=(1, 2))
 
             if reduce:
                 metrics = {k: torch.mean(v) for k, v in metrics.items()}

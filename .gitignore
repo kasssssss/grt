@@ -8,6 +8,7 @@
 
 # Scratch scripts
 *.sh
+!/scripts/autodl_*.sh
 
 # Symlinks
 /roverp

@@ -51,6 +51,7 @@ from .radar import (
     ComplexAmplitude,
     ComplexParts,
     ComplexPhase,
+    PrecomputedComplexPhaseAugment,
     RADsLikeDoppler,
     RadarResolution,
     Representation,
@@ -64,6 +65,7 @@ __all__ = [
     "Destagger", "Map2D", "Map3D", "Depth",
     "RelativeVelocity",
     "AmplitudeAOA", "ComplexAmplitude", "ComplexParts", "ComplexPhase",
+    "PrecomputedComplexPhaseAugment",
     "RADsLikeDoppler",
     "RadarResolution", "Representation",
     "ColoradarMap2d"
