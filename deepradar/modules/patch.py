@@ -180,31 +180,39 @@ class Unpatch(nn.Module):
         self.size = size
         self.output_size = output_size
 
-    def forward(
-        self, x: Float[Tensor, "n xin c"]
+    def forward_grid(
+        self, x: Float[Tensor, "n xin c"], grid: Sequence[int]
     ) -> Float[Tensor, "n *xout c_out"]:
-        """Perform 2D unpatching.
-
-        Operates in batch-spatial-feature order; spatial axes are flattened on
-        the input, and unflattened in the output.
-        """
+        """Unpatch a flattened explicit patch grid using shared weights."""
+        if len(grid) != len(self.size):
+            raise ValueError("grid and patch size must have the same rank.")
+        if x.shape[1] != int(np.prod(grid)):
+            raise ValueError(
+                f"Expected {int(np.prod(grid))} patches, got {x.shape[1]}.")
         embedding = self.linear(x)
 
         if len(self.size) == 2:
             return rearrange(
                 embedding, "n (x1 x2) (s1 s2 c) -> n (x1 s1) (x2 s2) c",
-                x1=self.output_size[0] // self.size[0],
-                x2=self.output_size[1] // self.size[1],
+                x1=grid[0], x2=grid[1],
                 s1=self.size[0], s2=self.size[1], c=self.output_size[-1])
         elif len(self.size) == 3:
             return rearrange(
                 embedding,
                 "n (x1 x2 x3) (s1 s2 s3 c) -> n (x1 s1) (x2 s2) (x3 s3) c",
-                x1=self.output_size[0] // self.size[0],
-                x2=self.output_size[1] // self.size[1],
-                x3=self.output_size[2] // self.size[2],
+                x1=grid[0], x2=grid[1], x3=grid[2],
                 s1=self.size[0], s2=self.size[1], s3=self.size[2],
                 c=self.output_size[-1])
         else:
             raise ValueError(
                 "Unpatch is only implemented for 2D and 3D tensors.")
+
+    def forward(
+        self, x: Float[Tensor, "n xin c"]
+    ) -> Float[Tensor, "n *xout c_out"]:
+        """Perform unpatching for the configured output shape."""
+        grid = [
+            output // patch
+            for output, patch in zip(self.output_size, self.size)
+        ]
+        return self.forward_grid(x, grid)

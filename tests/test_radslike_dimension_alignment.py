@@ -74,7 +74,9 @@ def test_official_patch_resize_has_a256_shape_and_finite_values() -> None:
     assert np.isfinite(float(resized.std()))
 
 
-def make_decoder(cls: type[TransformerDecoder]) -> TransformerDecoder:
+def make_decoder(
+    cls: type[TransformerDecoder], **kwargs,
+) -> TransformerDecoder:
     return cls(
         key="map",
         layers=0,
@@ -84,7 +86,47 @@ def make_decoder(cls: type[TransformerDecoder]) -> TransformerDecoder:
         shape=[8, 16, 8],
         patch=[2, 4, 2],
         positions="nd",
+        **kwargs,
     )
+
+
+def test_half_shift_has_no_new_state_and_zero_is_bit_exact() -> None:
+    torch.manual_seed(13)
+    baseline = make_decoder(TransformerDecoder)
+    disabled = make_decoder(TransformerDecoder, shift_blend=0.0)
+    shifted = make_decoder(TransformerDecoder, shift_blend=0.5)
+    disabled.load_state_dict(baseline.state_dict())
+    shifted.load_state_dict(baseline.state_dict())
+    assert baseline.state_dict().keys() == shifted.state_dict().keys()
+
+    encoded = torch.randn(2, 9, 32)
+    torch.testing.assert_close(
+        disabled(encoded)["map"], baseline(encoded)["map"],
+        rtol=0.0, atol=0.0,
+    )
+
+
+def test_half_shift_shape_border_and_gradient_contract() -> None:
+    torch.manual_seed(17)
+    baseline = make_decoder(TransformerDecoder)
+    shifted = make_decoder(TransformerDecoder, shift_blend=0.5)
+    shifted.load_state_dict(baseline.state_dict())
+    encoded = torch.randn(2, 9, 32)
+    base_out = baseline(encoded)["map"]
+    shift_out = shifted(encoded)["map"]
+    assert shift_out.shape == (2, 8, 16, 8)
+
+    # Half of patch [2,4,2] leaves [1,2,1] voxels unchanged at each border.
+    assert torch.equal(shift_out[:, 0], base_out[:, 0])
+    assert torch.equal(shift_out[:, -1], base_out[:, -1])
+    assert torch.equal(shift_out[:, :, :2], base_out[:, :, :2])
+    assert torch.equal(shift_out[:, :, -2:], base_out[:, :, -2:])
+    assert torch.equal(shift_out[..., 0], base_out[..., 0])
+    assert torch.equal(shift_out[..., -1], base_out[..., -1])
+
+    shift_out.square().mean().backward()
+    assert shifted.unpatch.linear.weight.grad is not None
+    assert torch.count_nonzero(shifted.unpatch.linear.weight.grad) > 0
 
 
 def test_zero_initialized_refiner_matches_baseline() -> None:

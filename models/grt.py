@@ -214,13 +214,37 @@ class TransformerDecoder(L.LightningModule):
         pos_scale: Optional[Sequence[float]] = None, global_scale: float = 1.0,
         patch: Sequence[int] = (16, 16), out_dim: int = 0,
         positions: Literal["flat", "nd"] = "flat",
-        mode: Literal["last", "pool"] = "last"
+        mode: Literal["last", "pool"] = "last",
+        shift_blend: float = 0.0,
     ) -> None:
         super().__init__()
 
         self.key = key
         self.out_dim = out_dim
         self.mode = mode
+        self.shift_blend = float(shift_blend)
+        if not 0.0 <= self.shift_blend <= 1.0:
+            raise ValueError("shift_blend must be between zero and one.")
+
+        self.patch = tuple(int(value) for value in patch)
+        self.query_grid = tuple(
+            int(output) // patch_size
+            for output, patch_size in zip(shape, self.patch)
+        )
+        if any(
+            int(output) % patch_size != 0
+            for output, patch_size in zip(shape, self.patch)
+        ):
+            raise ValueError("patch must evenly divide decoder shape.")
+        if self.shift_blend > 0.0:
+            if positions != "nd" or len(self.query_grid) != 3:
+                raise ValueError(
+                    "shift_blend currently requires a 3D nd-position decoder.")
+            if any(size < 2 for size in self.query_grid):
+                raise ValueError(
+                    "shift_blend requires at least two patches per axis.")
+            if any(size % 2 != 0 for size in self.patch):
+                raise ValueError("shift_blend requires even patch sizes.")
 
         self.layers = nn.ModuleList([
             modules.TransformerDecoder(
@@ -228,7 +252,7 @@ class TransformerDecoder(L.LightningModule):
                 n_head=dim // head_dim, dropout=dropout, activation=activation)
             for _ in range(layers)])
 
-        query_shape = [s // p for s, p in zip(shape, patch)]
+        query_shape = list(self.query_grid)
         if positions == "flat":
             query_shape = [int(np.prod(query_shape))]
         self.query = modules.BasisChange(
@@ -236,7 +260,28 @@ class TransformerDecoder(L.LightningModule):
 
         self.unpatch = modules.Unpatch(
             output_size=(*shape, max(1, self.out_dim)),
-            features=dim, size=patch)
+            features=dim, size=self.patch)
+
+    def _decode_queries(
+        self, query: Float[Tensor, "n q c"],
+        encoded: Float[Tensor, "n s c"],
+    ) -> Float[Tensor, "n q c"]:
+        for layer in self.layers:
+            query = layer(query, encoded)
+        return query
+
+    def _shift_queries(
+        self, query: Float[Tensor, "n q c"]
+    ) -> Float[Tensor, "n q_shift c"]:
+        """Average neighboring query corners to form a half-patch grid."""
+        n, _, c = query.shape
+        q1, q2, q3 = self.query_grid
+        grid = query.reshape(n, q1, q2, q3, c)
+        shifted = sum(
+            grid[:, i:i + q1 - 1, j:j + q2 - 1, k:k + q3 - 1]
+            for i in (0, 1) for j in (0, 1) for k in (0, 1)
+        ) / 8.0
+        return shifted.reshape(n, -1, c)
 
     def forward(
         self, encoded: Float[Tensor, "n s c"]
@@ -259,10 +304,21 @@ class TransformerDecoder(L.LightningModule):
 
         x = self.query(x)
         enc = encoded[:, :-1, :]
-        for layer in self.layers:
-            x = layer(x, enc)
-
-        out = self.unpatch(x)
+        out = self.unpatch(self._decode_queries(x, enc))
+        if self.shift_blend > 0.0:
+            shifted_grid = tuple(size - 1 for size in self.query_grid)
+            shifted = self.unpatch.forward_grid(
+                self._decode_queries(self._shift_queries(x), enc), shifted_grid)
+            slices = tuple(
+                slice(patch // 2, patch // 2 + shifted_size)
+                for patch, shifted_size in zip(self.patch, shifted.shape[1:-1])
+            )
+            out = out.clone()
+            out[(slice(None), *slices, slice(None))] = torch.lerp(
+                out[(slice(None), *slices, slice(None))],
+                shifted,
+                self.shift_blend,
+            )
         if self.out_dim == 0:
             out = out[..., 0]
 

@@ -124,3 +124,55 @@ Recommended first run:
 
 On the verified cache, one full epoch contains 17,465 optimizer steps. Recheck
 the actual dataloader length at launch if the trace set or batch size changes.
+
+## Failed Visibility-Only Supervision Ablation
+
+Masking every voxel after the first LiDAR return was tested for one complete
+558,902-sample training epoch from `best-primary-017-9000.ckpt`. It improved
+validation first-hit depth MAE from `6.078` to `4.544` range bins, but collapsed
+`map_f1` from `0.28725` to `0.04171` and filled the predicted BEV with dense
+fan-shaped occupancy. The post-hit volume became unconstrained.
+
+Do not use visibility-only masking. Retain dense BCE and test boundary-specific
+supervision only as a low-weight auxiliary ray-termination loss. The auxiliary
+term must remain disabled by default so official configurations and checkpoints
+retain their original behavior.
+
+The follow-up dense-BCE plus ray-termination experiment used a calibrated
+weight of `0.005` (about 15% of baseline BCE at initialization). It improved
+I/Q-1M `map_f1` from `0.28725` to `0.32066` and Chamfer from `1.939` to
+`1.651`, but reduced recall from `0.695` to `0.525`, worsened depth MAE from
+`6.078` to `6.282`, and reduced the fixed RADs three-frame `logit > 0` sparse
+GT F1 from `0.01162` to `0.01102`. It also compressed high-confidence RADs
+responses. This auxiliary loss is therefore not retained in the production
+configuration.
+
+## Half-Patch Shift Decoder Ablation
+
+The 3D occupancy decoder emits disjoint `8 x 8 x 8` voxel patches. A
+parameter-free shifted branch was tested to expose each interior voxel to a
+second, half-patch-offset query grid. It reuses the existing decoder and
+unpatch weights, blends only the interior volume, adds no state-dict keys, and
+is bit-exact when `shift_blend: 0`. The optional ablation configuration uses a
+conservative `shift_blend: 0.25`; the default model remains unchanged.
+
+On the fixed 2,048-sample RADs-like I/Q-1M validation subset, applying this
+branch to `best-primary-017-9000.ckpt` without updating any weights changed:
+
+- `map_f1`: `0.29321 -> 0.30037`
+- decoder patch-boundary/interior jump ratio: `1.988 -> 1.745`
+- first-hit depth MAE: `6.988 -> 7.091` range bins
+- BCE: `0.14148 -> 0.14160`
+
+The fixed three-frame RADs sparse-GT F1 changed from
+`0.00992/0.01162/0.01443` to `0.01028/0.01126/0.01610` at logit thresholds
+`-1/0/+1`, respectively. The branch therefore improves source F1, patch
+continuity, and high-confidence RADs responses, but is an inference-time
+tradeoff rather than a universal transfer improvement.
+
+Do not fine-tune the full model merely to adapt this branch. One full
+558,902-sample epoch reduced `map_f1` to `0.28953`, raised the jump ratio to
+`1.908`, and reduced all three fixed-frame RADs F1 values. A separate
+3,000-step unpatch-only run also failed (`map_f1=0.28013`, depth MAE `6.761`).
+Both checkpoints are rejected. Retain the original step-9000 checkpoint and
+use the shifted branch only as the documented optional ablation.

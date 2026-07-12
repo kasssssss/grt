@@ -1,0 +1,4 @@
+# Conservative shared-weight half-patch decoder grid. No state-dict keys are added.
+decoder:
+  args:
+    shift_blend: 0.25
