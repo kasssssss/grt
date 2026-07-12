@@ -104,6 +104,11 @@ LIMIT_ARGS=()
 if [[ -n "${LIMIT_TRAIN:-}" ]]; then
   LIMIT_ARGS+=(--limit_train_batches "${LIMIT_TRAIN}")
 fi
+
+SEED_ARGS=()
+if [[ -n "${SEED:-}" ]]; then
+  SEED_ARGS+=(--seed "${SEED}")
+fi
 if [[ -n "${LIMIT_VAL:-}" ]]; then
   LIMIT_ARGS+=(--limit_val_batches "${LIMIT_VAL}")
 fi
@@ -117,7 +122,12 @@ fi
 LOG="${OUT}/train_${MODE}_${RUN_TS}.log"
 
 INIT_ARGS=()
-if [[ -n "${BASE_MODEL:-}" ]]; then
+if [[ "${FROM_SCRATCH:-0}" == "1" ]]; then
+  if [[ -n "${BASE_MODEL:-}" ]]; then
+    echo "FROM_SCRATCH=1 cannot be combined with BASE_MODEL." >&2
+    exit 2
+  fi
+elif [[ -n "${BASE_MODEL:-}" ]]; then
   INIT_ARGS+=(--base_model "${BASE_MODEL}")
   if [[ "${LOAD_FULL_DECODER:-0}" == "1" ]]; then
     INIT_ARGS+=(--load_full_decoder)
@@ -143,10 +153,12 @@ fi
   echo "OBJECTIVE=${OBJ}"
   echo "OFFICIAL=${OFFICIAL}"
   echo "BASE_MODEL=${BASE_MODEL:-}"
+  echo "FROM_SCRATCH=${FROM_SCRATCH:-0}"
   echo "INIT_ARGS=${INIT_ARGS[*]}"
   echo "DECODER_HEAD=${DECODER_HEAD}"
   echo "EPOCHS=${EPOCHS} PATIENCE=${PATIENCE} WORKERS=${WORKERS}"
   echo "ACCUMULATE=${ACCUMULATE} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+  echo "SEED=${SEED:-}"
   echo "LIMIT_ARGS=${LIMIT_ARGS[*]:-}"
   date -Is
   df -h /root/autodl-tmp /root/autodl-fs /
@@ -170,6 +182,7 @@ python -u train.py \
   --workers "${WORKERS}" \
   --accumulate_grad_batches "${ACCUMULATE}" \
   --precision "${PRECISION:-bf16-mixed}" \
+  "${SEED_ARGS[@]}" \
   --name "${NAME}" \
   --version "${VERSION}" \
   "${LIMIT_ARGS[@]}" \

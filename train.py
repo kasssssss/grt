@@ -241,6 +241,9 @@ def _parse():
         "--precision", default="16-mixed",
         help="Lightning precision mode. AutoDL launchers explicitly select "
         "bf16-mixed for RTX 5090.")
+    g.add_argument(
+        "--seed", default=None, type=int,
+        help="Optional reproducibility seed for model, data, and workers.")
 
     g = p.add_argument_group("Environment")
     g.add_argument(
@@ -256,6 +259,9 @@ def _parse():
 
 
 def _main(args):
+
+    if args.seed is not None:
+        L.seed_everything(args.seed, workers=True)
 
     if args.environment == "psc":
         torch.multiprocessing.set_sharing_strategy('file_system')
