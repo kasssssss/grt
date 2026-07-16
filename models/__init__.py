@@ -19,7 +19,14 @@ from .grt import (
 from .grtf import TransformerFourierEncoder
 from .swin import SwinDPT2DDecoder, SwinTransformerEncoder
 from .t_fftradnet import TFFTRadNet2DDecoder, TFFTRadNetEncoder
-from .unet import UNet3DDecoder, UNet3DEncoder, UNetBEVDecoder, UNetEncoder
+from .unet import (
+    AzimuthFFTUNet3DEncoder,
+    AzimuthFFTUNetEncoder,
+    UNet3DDecoder,
+    UNet3DEncoder,
+    UNetBEVDecoder,
+    UNetEncoder,
+)
 from .unext import UNeXTBEVDecoder, UNeXTEncoder
 
 __all__ = [
@@ -28,7 +35,8 @@ __all__ = [
     "TransformerDecoder", "ResidualRefinedTransformerDecoder", "VectorDecoder",
     "TransformerFourierEncoder",
     "SwinDPT2DDecoder", "SwinTransformerEncoder",
-    "UNetEncoder", "UNetBEVDecoder", "UNet3DEncoder", "UNet3DDecoder",
+    "UNetEncoder", "AzimuthFFTUNetEncoder", "UNetBEVDecoder",
+    "UNet3DEncoder", "AzimuthFFTUNet3DEncoder", "UNet3DDecoder",
     "UNeXTEncoder", "UNeXTBEVDecoder",
     "TFFTRadNetEncoder", "TFFTRadNet2DDecoder"
 ]

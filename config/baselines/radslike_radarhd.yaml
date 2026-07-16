@@ -1,0 +1,26 @@
+# RadarHD on the same precomputed single-elevation A256 RADs-like tensor used
+# by the GRT adaptation experiments. The encoder applies the identical
+# phase-preserving A8-to-A256 expansion before selecting elevation index zero.
+encoder:
+  :name: AzimuthFFTUNetEncoder
+  args:
+    azimuth_bins: 256
+    elevation_index: 0
+
+decoder:
+  args:
+    azimuth_upsamples: 2
+
+dataset:
+  channels:
+    radar:
+      name: PrecomputedRadarChannel
+      indices: radar
+      :args:
+        cache_root: /root/autodl-tmp/data/iq1m_radslike_precomputed_single_elev_f16_v1
+        sensor: radar
+        index_file: _fusion/indices.npz
+        lru_size: 8
+        transform:
+        - name: PrecomputedComplexPhaseAugment
+          args: {}

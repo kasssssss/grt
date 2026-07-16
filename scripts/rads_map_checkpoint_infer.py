@@ -144,6 +144,17 @@ def reduce_azimuth(
     raise ValueError(f"Unknown A8 reducer {mode!r}.")
 
 
+def keep_center_doppler(dar: np.ndarray, keep_bins: int) -> np.ndarray:
+    """Keep the centered physical Doppler support used by RADs-like I/Q-1M."""
+    keep_bins = int(keep_bins)
+    if keep_bins <= 0 or keep_bins >= dar.shape[0]:
+        return dar
+    start = (dar.shape[0] - keep_bins) // 2
+    out = np.zeros_like(dar)
+    out[start:start + keep_bins] = dar[start:start + keep_bins]
+    return out
+
+
 def apply_mag_keep_frac(sample: np.ndarray, keep_frac: float) -> tuple[np.ndarray, float]:
     keep_frac = float(keep_frac)
     if keep_frac >= 1.0:
@@ -173,6 +184,7 @@ def build_sample(
     az_smooth: float,
     amp_scale: float,
     mag_keep_frac: float,
+    doppler_keep_bins: int,
 ) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray], dict[str, float]]:
     dar = to_dar(cube_raz, flip_azimuth=flip_azimuth)
     raw_mag = np.sqrt(np.abs(dar)).astype(np.float32)
@@ -181,6 +193,7 @@ def build_sample(
         "rd": raw_mag.max(axis=1),      # [doppler, range]
         "ad": raw_mag.max(axis=2),      # [doppler, azimuth]
     }
+    dar = keep_center_doppler(dar, doppler_keep_bins)
 
     complex_model = reduce_azimuth(
         dar, target_azimuth_bins, a8_reducer, beam_sigma)
@@ -202,6 +215,7 @@ def build_sample(
     }
     stats = {
         "mag_keep_frac": float(mag_keep_frac),
+        "doppler_keep_bins": float(doppler_keep_bins),
         "azimuth_bins": float(target_azimuth_bins),
         "mag_keep_threshold": float(mag_keep_threshold),
         "mag_nonzero_frac": float(np.mean(amp_model > 0.0)),
@@ -226,7 +240,9 @@ def prepare_modes(
     range_smooth: float,
     az_smooth: float,
     amp_scale: float,
+    crop_fraction: float = 1.0,
     mag_keep_frac: float = 1.0,
+    doppler_keep_bins: int = 0,
     gt_path: Path | None = None,
 ) -> list[Prepared]:
     cube = np.load(path)
@@ -239,13 +255,15 @@ def prepare_modes(
         if gt_cube.shape != cube.shape:
             raise ValueError(
                 f"RADs_gt must match RADs shape {cube.shape}, got {gt_cube.shape}.")
+    if not 0.0 <= crop_fraction <= 1.0:
+        raise ValueError("crop_fraction must be in [0, 1].")
     auto_start, _threshold = first_signal_index(cube)
     prepared: list[Prepared] = []
     for mode in modes:
         if mode == "nocrop":
             start = 0
         elif mode == "crop_auto":
-            start = auto_start
+            start = int(round(auto_start * crop_fraction))
         else:
             raise ValueError(f"unknown mode {mode!r}")
         shifted = shift_range_cube(cube, start)
@@ -259,6 +277,7 @@ def prepare_modes(
             az_smooth=az_smooth,
             amp_scale=amp_scale,
             mag_keep_frac=mag_keep_frac,
+            doppler_keep_bins=doppler_keep_bins,
         )
         gt_polar = None
         if gt_cube is not None:
@@ -406,7 +425,10 @@ def render_frame(
     row_defs = [
         ("raw RA sqrt(abs), x=range", "raw_ra"),
         ("raw RD sqrt(abs), x=range", "raw_rd"),
+        ("raw AD sqrt(abs), x=azimuth", "raw_ad"),
         ("model input RA mag", "input_ra"),
+        ("model input RD mag", "input_rd"),
+        ("model input AD mag", "input_ad"),
         ("pred BEV polar prob maxE", "bev_polar_prob"),
         ("RADs_gt polar occupancy", "gt_polar"),
         ("first-hit depth logit>-1", "depth_-1"),
@@ -464,11 +486,25 @@ def render_frame(
                 imshow_mag(ax, image, col_title)
             elif key == "raw_rd":
                 imshow_mag(ax, prep.raw_views["rd"], "raw RD: y=doppler, x=range")
+            elif key == "raw_ad":
+                imshow_mag(ax, prep.raw_views["ad"], "raw AD: y=doppler, x=azimuth")
             elif key == "input_ra":
                 imshow_mag(
                     ax,
                     prep.input_views["ra"],
                     f"model input RA: y={prep.azimuth_bins} bins, x=range",
+                )
+            elif key == "input_rd":
+                imshow_mag(
+                    ax,
+                    prep.input_views["rd"],
+                    "model input RD: y=doppler, x=range",
+                )
+            elif key == "input_ad":
+                imshow_mag(
+                    ax,
+                    prep.input_views["ad"],
+                    "model input AD: y=doppler, x=azimuth",
                 )
             elif key == "bev_polar_prob":
                 imshow_prob(ax, pred["bev_polar_prob_maxe"], "pred BEV polar prob maxE")
@@ -539,7 +575,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rads-root", type=Path, default=Path("/root/autodl-tmp/data/RADs"))
     parser.add_argument("--gt-root", type=Path, default=Path("/root/autodl-tmp/data/RADs_gt"))
     parser.add_argument("--frames", nargs="+", default=["100/000050", "100/000001", "101/000001"])
-    parser.add_argument("--modes", nargs="+", choices=["nocrop", "crop_auto"], default=["crop_auto"])
+    parser.add_argument(
+        "--modes", nargs="+", choices=["nocrop", "crop_auto"],
+        default=["nocrop", "crop_auto"],
+    )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--hparams", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, default=Path("/root/autodl-fs/outputs/grt/rads_map_checkpoint_infer"))
@@ -559,8 +598,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--range-smooth", type=float, default=1.4)
     parser.add_argument("--az-smooth", type=float, default=0.45)
-    parser.add_argument("--amp-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--crop-fraction", type=float, default=1.0,
+        help="Fraction of the automatically detected empty near-range prefix to shift out.",
+    )
+    parser.add_argument(
+        "--amp-scale", type=float, default=7.0,
+        help=(
+            "Magnitude scale applied after ComplexPhase conversion. The "
+            "RADs-like default 7 matches the geometric-median active-bin "
+            "magnitude ratio measured against the training cache."
+        ),
+    )
     parser.add_argument("--mag-keep-frac", type=float, default=1.0)
+    parser.add_argument(
+        "--doppler-keep-bins", type=int, default=11,
+        help=(
+            "Keep only this many centered Doppler bins before representation "
+            "conversion; 0 keeps all bins. The RADs-like training cache "
+            "occupies exactly the centered 11 of 64 bins."
+        ),
+    )
     parser.add_argument("--no-flip-azimuth", action="store_true")
     return parser.parse_args(argv)
 
@@ -588,11 +646,14 @@ def main() -> int:
         target_azimuth_bins = int(getattr(model.encoder, "azimuth_bins", 8))
     else:
         target_azimuth_bins = int(args.input_azimuth_bins)
-    expected_bins = int(getattr(model.encoder, "azimuth_bins", 8))
-    if expected_bins != target_azimuth_bins:
+    encoder_azimuth_bins = int(getattr(model.encoder, "azimuth_bins", 8))
+    supports_phase_expansion = hasattr(model.encoder, "azimuth_bins")
+    if target_azimuth_bins > encoder_azimuth_bins or (
+        not supports_phase_expansion and target_azimuth_bins != encoder_azimuth_bins
+    ):
         raise ValueError(
-            f"Checkpoint encoder expects A={expected_bins}, but requested "
-            f"A={target_azimuth_bins}.")
+            f"Checkpoint encoder supports input A<={encoder_azimuth_bins}, "
+            f"but requested A={target_azimuth_bins}.")
 
     all_summary = {
         "repo": str(repo),
@@ -603,12 +664,15 @@ def main() -> int:
         "hparams": str(args.hparams),
         "device": str(device),
         "input_azimuth_bins": target_azimuth_bins,
+        "crop_fraction": args.crop_fraction,
         "a8_reducer": args.a8_reducer if target_azimuth_bins == 8 else None,
+        "doppler_keep_bins": args.doppler_keep_bins,
         "frames": [],
         "notes": [
             "RADs arrays are treated as [range, azimuth, doppler].",
-            "RADs inference defaults to crop_auto because no-crop consistently under-activates the trained map head.",
+            "RADs inference renders nocrop and crop_auto by default because the best range alignment is checkpoint-dependent.",
             "crop_auto shifts the whole 3D RAD cube along range before any RA/RD/AD/model input derivation.",
+            "RADs-like defaults keep the centered 11/64 Doppler bins and use amplitude scale 7, calibrated against the training cache.",
             f"Model input is [D,A,E,R,C]=[64,{target_azimuth_bins},1,256,2], "
             "where C=(sqrt(abs(complex)), phase).",
             "A256 checkpoints retain the cropped RADs azimuth axis directly; "
@@ -630,7 +694,9 @@ def main() -> int:
             range_smooth=args.range_smooth,
             az_smooth=args.az_smooth,
             amp_scale=args.amp_scale,
+            crop_fraction=args.crop_fraction,
             mag_keep_frac=args.mag_keep_frac,
+            doppler_keep_bins=args.doppler_keep_bins,
             gt_path=args.gt_root / rel.parent / f"{rel.name}.npy",
         )
         preds = [infer_one(model, prep, device) for prep in prepared]

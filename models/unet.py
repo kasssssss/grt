@@ -6,6 +6,41 @@ from torch import Tensor, nn
 from einops import rearrange
 
 
+def _expand_complex_phase_azimuth(
+    x: Float[Tensor, "n d a e r c"], azimuth_bins: int
+) -> Float[Tensor, "n d a2 e r c"]:
+    """Zero-pad the antenna aperture, matching the A256 GRT encoder."""
+    if x.ndim != 6 or x.shape[-1] != 2:
+        raise ValueError(
+            "Expected ComplexPhase input [N,D,A,E,R,2], "
+            f"got {tuple(x.shape)}.")
+
+    source_bins = int(x.shape[2])
+    if source_bins == azimuth_bins:
+        return x
+    if source_bins > azimuth_bins:
+        raise ValueError(
+            f"Cannot phase-preservingly shrink A={source_bins} to "
+            f"A={azimuth_bins}.")
+
+    magnitude = x[..., 0].float().square()
+    phase = x[..., 1].float()
+    spectrum = torch.polar(magnitude, phase)
+    aperture = torch.fft.ifft(
+        torch.fft.ifftshift(spectrum, dim=2), dim=2)
+    padding = torch.zeros(
+        (*aperture.shape[:2], azimuth_bins - source_bins,
+         *aperture.shape[3:]),
+        dtype=aperture.dtype,
+        device=aperture.device,
+    )
+    aperture = torch.cat((aperture, padding), dim=2)
+    expanded = torch.fft.fftshift(
+        torch.fft.fft(aperture, dim=2), dim=2)
+    return torch.stack(
+        (torch.sqrt(torch.abs(expanded)), torch.angle(expanded)), dim=-1)
+
+
 def _unetblock(
     d_in: int = 64, d_out: int = 64, d_hidden: int = 64
 ) -> nn.Module:
@@ -105,6 +140,29 @@ class UNetEncoder(nn.Module):
         return [x5, x4, x3, x2, x1]
 
 
+class AzimuthFFTUNetEncoder(UNetEncoder):
+    """RadarHD encoder with the same phase-preserving A8-to-A256 expansion."""
+
+    def __init__(
+        self, azimuth_bins: int = 256, elevation_index: int = 0,
+        **kwargs
+    ) -> None:
+        super().__init__(**kwargs)
+        self.azimuth_bins = azimuth_bins
+        self.elevation_index = elevation_index
+
+    def forward(
+        self, x: Float[Tensor, "n d a e r c"]
+    ) -> list[Float[Tensor, "n ..."]]:
+        x = _expand_complex_phase_azimuth(x, self.azimuth_bins)
+        if not 0 <= self.elevation_index < x.shape[3]:
+            raise IndexError(
+                f"elevation_index={self.elevation_index} is invalid for "
+                f"E={x.shape[3]}.")
+        magnitude = x[:, :, :, self.elevation_index, :, 0]
+        return super().forward(magnitude)
+
+
 class UNetBEVDecoder(nn.Module):
     """Generic U-net decoder for range-azimuth radar [N1]_.
 
@@ -116,10 +174,16 @@ class UNetBEVDecoder(nn.Module):
         dim: model width (i.e. number of features).
     """
 
-    def __init__(self, key: str = "bev", dim: int = 64) -> None:
+    def __init__(
+        self, key: str = "bev", dim: int = 64,
+        azimuth_upsamples: int = 4
+    ) -> None:
         super().__init__()
 
         self.key = key
+        if not 0 <= azimuth_upsamples <= 4:
+            raise ValueError("azimuth_upsamples must be between 0 and 4.")
+        self.azimuth_upsamples = azimuth_upsamples
 
         # (512 + 512)C x 4D x 16R
         self.up1 = UNetUp(dim * 16, dim * 4)  # -> 256C x 8A x 32R
@@ -151,10 +215,10 @@ class UNetBEVDecoder(nn.Module):
         x = self.up2(x, x3)
         x = self.up3(x, x2)
         x = self.up4(x, x1)
-        x = self.up5(x)
-        x = self.up6(x)
-        x = self.up7(x)
-        x = self.up8(x)
+        for up in (self.up5, self.up6, self.up7, self.up8)[
+            :self.azimuth_upsamples
+        ]:
+            x = up(x)
 
         return {self.key: self.out(x)}
 
@@ -204,6 +268,23 @@ class UNet3DEncoder(nn.Module):
         return [x5, x4, x3]
 
 
+class AzimuthFFTUNet3DEncoder(UNet3DEncoder):
+    """RadarHD3D encoder with the GRT phase-preserving azimuth expansion."""
+
+    def __init__(
+        self, azimuth_bins: int = 256,
+        **kwargs
+    ) -> None:
+        super().__init__(**kwargs)
+        self.azimuth_bins = azimuth_bins
+
+    def forward(
+        self, x: Float[Tensor, "n d a e r c"]
+    ) -> list[Float[Tensor, "n ..."]]:
+        x = _expand_complex_phase_azimuth(x, self.azimuth_bins)
+        return super().forward(x[..., 0])
+
+
 class UNet3DDecoder(nn.Module):
     """U-net decoder for range-azimuth-elevation radar [N1]_.
 
@@ -212,17 +293,27 @@ class UNet3DDecoder(nn.Module):
         dim: model width (i.e. number of features).
     """
 
-    def __init__(self, key: str = "bev", dim: int = 64) -> None:
+    def __init__(
+        self, key: str = "bev", dim: int = 64,
+        azimuth_upsamples: int = 2,
+        output_size: tuple[int, int] | None = None
+    ) -> None:
         super().__init__()
 
         self.key = key
+        if not 0 <= azimuth_upsamples <= 2:
+            raise ValueError("azimuth_upsamples must be between 0 and 2.")
+        self.azimuth_upsamples = azimuth_upsamples
+        self.output_size = output_size
 
         # (512 + 512)C x 8A x 8R
         self.up1 = UNetUp(dim * 16, dim * 4)  # -> 256C x 16A x 32R
         self.up2 = UNetUp(dim * 8, dim * 2)  # -> 128C x 32A x 64R
         self.up3 = AzimuthUp(dim * 2, dim * 2)  # -> 128C x 64A x 64R
         self.up4 = AzimuthUp(dim * 2, dim)  # -> 64C x 128A x 64R
-        self.out = nn.Conv2d(64, 64, kernel_size=1)  # -> 64E x 128A x 64R
+        out_channels = dim if azimuth_upsamples == 2 else dim * 2
+        self.out = nn.Conv2d(
+            out_channels, 64, kernel_size=1)  # -> 64E x 128A x 64R
 
     def forward(
         self, encoded: list[Float[Tensor, "n ..."]]
@@ -239,7 +330,12 @@ class UNet3DDecoder(nn.Module):
 
         x = self.up1(x5, x4)
         x = self.up2(x, x3)
-        x = self.up3(x)
-        x = self.up4(x)
+        for up in (self.up3, self.up4)[:self.azimuth_upsamples]:
+            x = up(x)
+
+        if self.output_size is not None:
+            x = nn.functional.interpolate(
+                x, size=self.output_size, mode='bilinear',
+                align_corners=True)
 
         return {self.key: self.out(x)}

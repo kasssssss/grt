@@ -177,13 +177,29 @@ class PointCloudObjective(ABC):
     def _forward(self, x, y):
         pts_x = self.as_points(x)
         pts_y = self.as_points(y)
-        dist = self.distance(pts_x, pts_y)
-
-        if dist.shape[0] == 0 or dist.shape[1] == 0:
+        if pts_x.shape[0] == 0 or pts_y.shape[0] == 0:
             return torch.full((), self.on_empty, device=x.device)
 
-        d1 = torch.min(dist, dim=0).values
-        d2 = torch.min(dist, dim=1).values
+        # Dense early predictions can contain hundreds of thousands of points.
+        # Materializing their full pairwise matrix can require tens of GiB, so
+        # stream exact nearest-neighbor reductions in bounded-size chunks.
+        max_pairs = 4_000_000
+        if pts_x.shape[0] * pts_y.shape[0] <= max_pairs:
+            dist = self.distance(pts_x, pts_y)
+            d1 = torch.min(dist, dim=0).values
+            d2 = torch.min(dist, dim=1).values
+        else:
+            chunk_size = max(1, max_pairs // pts_y.shape[0])
+            d1 = torch.full(
+                (pts_y.shape[0],), torch.inf,
+                device=pts_y.device, dtype=pts_y.dtype)
+            d2_chunks = []
+            for start in range(0, pts_x.shape[0], chunk_size):
+                dist = self.distance(
+                    pts_x[start:start + chunk_size], pts_y)
+                d1 = torch.minimum(d1, torch.min(dist, dim=0).values)
+                d2_chunks.append(torch.min(dist, dim=1).values)
+            d2 = torch.cat(d2_chunks)
 
         if self.mode == "modhausdorff":
             return torch.median(torch.concatenate([d1, d2]))
