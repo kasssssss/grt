@@ -96,8 +96,11 @@ def render_frame(
         gt_polar = pred["gt_polar"].astype(bool)
         bev_prob = pred["bev_polar_prob_maxe"].astype(np.float32)
         depth_m1 = pred["depth_logit_gt_m1"].astype(np.float32)
+        depth_0 = pred["depth_logit_gt_0"].astype(np.float32)
+        depth_1 = pred["depth_logit_gt_1"].astype(np.float32)
         invalid_m1 = pred["invalid_mask_logit_gt_m1"].astype(bool)
         invalid_0 = pred["invalid_mask_logit_gt_0"].astype(bool)
+        invalid_1 = pred["invalid_mask_logit_gt_1"].astype(bool)
 
     shifted = shift_range_cube(cube, crop_start)
     _, raw_views, input_views, _ = build_sample(
@@ -167,17 +170,42 @@ def render_frame(
     fig.savefig(main_path, dpi=dpi, facecolor="white")
     plt.close(fig)
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
-    for ax, mask, threshold in zip(axes, (invalid_m1, invalid_0), (-1, 0)):
-        ax.imshow(
+    thresholds = (-1, 0, 1)
+    depths = (depth_m1, depth_0, depth_1)
+    masks = (invalid_m1, invalid_0, invalid_1)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 8), constrained_layout=True)
+    for column, (threshold, depth, mask) in enumerate(
+        zip(thresholds, depths, masks)
+    ):
+        show_depth(
+            axes[0, column],
+            depth,
+            mask,
+            f"First-hit depth logit>{threshold} "
+            f"(valid={1.0 - float(mask.mean()):.3f})",
+        )
+        set_axes(
+            axes[0, column],
+            "horizontal output cell",
+            "vertical output cell",
+        )
+        axes[1, column].imshow(
             mask.astype(np.float32), cmap="gray", origin="upper",
             aspect="auto", vmin=0.0, vmax=1.0, interpolation="nearest")
-        ax.set_title(
+        axes[1, column].set_title(
             f"Invalid mask logit>{threshold} | white=invalid | "
             f"fraction={float(mask.mean()):.3f}")
-        ax.set_xlabel("horizontal output cell")
-        ax.set_ylabel("vertical output cell")
-    mask_path = output_root / f"rads_{rel.parent.name}_{rel.name}_invalid_masks.png"
+        set_axes(
+            axes[1, column],
+            "horizontal output cell",
+            "vertical output cell",
+        )
+    fig.suptitle(
+        f"RADs first-hit threshold sweep | {rel.parent.name}/{rel.name}",
+        fontsize=16,
+    )
+    mask_path = output_root / (
+        f"rads_{rel.parent.name}_{rel.name}_depth_thresholds.png")
     fig.savefig(mask_path, dpi=dpi, facecolor="white")
     plt.close(fig)
     print(f"SAVED {main_path} {mask_path}")
