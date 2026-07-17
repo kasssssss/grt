@@ -8,6 +8,12 @@ CODE=${CODE:-/root/autodl-fs/projects/grt}
 DATA=${DATA:-/root/autodl-tmp/data/iq1m}
 CKPT_ROOT=${CKPT_ROOT:-/root/autodl-tmp/checkpoints/iq1m-checkpoints}
 OUT=${OUT:-/root/autodl-fs/outputs/grt/iq1m_radslike_autodl_5090_fixed_20260710}
+PYTHON_BIN=${PYTHON_BIN:-/root/autodl-tmp/envs/grt/bin/python}
+
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "GRT Python is not executable: ${PYTHON_BIN}" >&2
+  exit 2
+fi
 
 COMMON_CFG=${COMMON_CFG:-"grt/grt.yaml grt/small.yaml data/outdoor.yaml repr/rads_like.yaml data/iq1m_radslike_precomputed.yaml splits/codex_iq1m_radslike_model_selection_autodl.yaml optim/radslike_adapt.yaml"}
 EPOCHS=${EPOCHS:-200}
@@ -150,6 +156,7 @@ fi
   echo "CODE=${CODE}"
   echo "DATA=${DATA}"
   echo "OUT=${OUT}"
+  echo "PYTHON_BIN=${PYTHON_BIN}"
   echo "COMMON_CFG=${COMMON_CFG}"
   echo "OBJECTIVE=${OBJ}"
   echo "OFFICIAL=${OFFICIAL}"
@@ -166,7 +173,7 @@ fi
   nvidia-smi || true
 } | tee "${LOG}"
 
-python -u train.py \
+"${PYTHON_BIN}" -u train.py \
   -p "${DATA}" \
   -o "${OUT}" \
   -c ${COMMON_CFG} "${OBJ}" \
