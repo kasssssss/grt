@@ -140,6 +140,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iq-samples-per-trace", type=int, default=256)
     parser.add_argument("--rads-root", type=Path, required=True)
     parser.add_argument("--rads-samples", type=int, default=32)
+    parser.add_argument("--crop-fraction", type=float, default=1.0)
     parser.add_argument("--amp-scale", type=float, default=7.0)
     parser.add_argument("--doppler-keep-bins", type=int, default=11)
     parser.add_argument("--range-smooth", type=float, default=1.4)
@@ -194,6 +195,7 @@ def main() -> int:
             range_smooth=args.range_smooth,
             az_smooth=args.az_smooth,
             amp_scale=args.amp_scale,
+            crop_fraction=args.crop_fraction,
             mag_keep_frac=1.0,
             doppler_keep_bins=args.doppler_keep_bins,
         )[0]
@@ -231,6 +233,7 @@ def main() -> int:
         "iq_offset": args.iq_offset,
         "iq_samples_per_trace": args.iq_samples_per_trace,
         "rads_files": selected_files,
+        "crop_fraction": args.crop_fraction,
         "rads_crop_start": {
             "min": int(np.min(crop_starts)),
             "median": float(np.median(crop_starts)),

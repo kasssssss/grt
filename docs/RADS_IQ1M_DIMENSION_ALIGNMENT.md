@@ -244,6 +244,11 @@ frames and 32 evenly sampled RADs frames:
 - the A256 RADs tensor lost about `61.5%` relative L2 energy after fixed
   A8 projection and re-expansion.
 
+A partial near-range shift was also rejected. With `crop_fraction=0.5`, the
+RADs-to-power-I/Q-1M range JS divergence increased from `0.273` to `0.427`.
+Keep the full automatically detected shift for the complete 3D cube; matching
+only the median range bin does not match the full range-energy distribution.
+
 The last result does not by itself justify a VAE. A sequence-disjoint complex
 PCA rank-8 basis retained more than 99% of RADs energy, so the bottleneck is not
 rank alone; it is preserving the A8 coordinate semantics expected by the GRT
