@@ -29,12 +29,15 @@ EPS = 1e-12
 class Prepared:
     mode: str
     crop_start: int
+    crop_source: str
+    raw_crop_start: int
+    gt_crop_start: int | None
     azimuth_bins: int
     radar: np.ndarray
     sample: np.ndarray
     raw_views: dict[str, np.ndarray]
     input_views: dict[str, np.ndarray]
-    input_stats: dict[str, float]
+    input_stats: dict[str, float | str]
     gt_polar: np.ndarray | None
 
 
@@ -67,6 +70,31 @@ def first_signal_index(cube_raz: np.ndarray) -> tuple[int, float]:
     return int(hits[0]), threshold
 
 
+def first_gt_signal_index(gt_cube_raz: np.ndarray) -> int | None:
+    """Return the first range bin marked occupied by sparse RADs_gt."""
+    hits = np.flatnonzero(np.any(gt_cube_raz != 0, axis=(1, 2)))
+    return int(hits[0]) if hits.size else None
+
+
+def select_crop_start(
+    cube_raz: np.ndarray,
+    gt_cube_raz: np.ndarray | None,
+    crop_source: str,
+) -> tuple[int, str, int, int | None]:
+    """Select a reproducible whole-cube crop, preferring GT when requested."""
+    raw_start, _ = first_signal_index(cube_raz)
+    gt_start = (
+        first_gt_signal_index(gt_cube_raz)
+        if gt_cube_raz is not None
+        else None
+    )
+    if crop_source == "gt" and gt_start is not None:
+        return gt_start, "gt", raw_start, gt_start
+    if crop_source not in {"gt", "raw"}:
+        raise ValueError(f"unknown crop_source {crop_source!r}")
+    return raw_start, "raw", raw_start, gt_start
+
+
 def shift_range_cube(cube_raz: np.ndarray, start: int) -> np.ndarray:
     out = np.zeros_like(cube_raz)
     if start <= 0:
@@ -76,11 +104,48 @@ def shift_range_cube(cube_raz: np.ndarray, start: int) -> np.ndarray:
     return out
 
 
-def to_dar(cube_raz: np.ndarray, flip_azimuth: bool = True) -> np.ndarray:
+def project_gt_ar(
+    gt_ar: np.ndarray,
+    start: int,
+    *,
+    flip_azimuth: bool,
+    azimuth_flip_mode: str,
+) -> np.ndarray:
+    """Crop and project sparse native [azimuth,range] GT to [128,64]."""
+    if gt_ar.shape != (256, 256):
+        raise ValueError(f"expected manifest GT [256,256], got {gt_ar.shape}")
+    shifted = np.zeros(gt_ar.shape, dtype=bool)
+    if start <= 0:
+        shifted[...] = gt_ar
+    elif start < gt_ar.shape[1]:
+        shifted[:, :gt_ar.shape[1] - start] = gt_ar[:, start:]
+    if flip_azimuth:
+        shifted = shifted[::-1]
+        if azimuth_flip_mode == "spectral":
+            shifted = np.roll(shifted, 1, axis=0)
+        elif azimuth_flip_mode != "index":
+            raise ValueError(
+                f"unknown azimuth_flip_mode {azimuth_flip_mode!r}")
+    return shifted.reshape(128, 2, 64, 4).max(axis=(1, 3))
+
+
+def to_dar(
+    cube_raz: np.ndarray,
+    flip_azimuth: bool = True,
+    azimuth_flip_mode: str = "index",
+) -> np.ndarray:
     """RADs [range, azimuth, doppler] -> [doppler, azimuth, range]."""
     dar = np.moveaxis(cube_raz, [2, 1, 0], [0, 1, 2]).astype(np.complex64, copy=False)
     if flip_azimuth:
         dar = dar[:, ::-1, :]
+        if azimuth_flip_mode == "spectral":
+            # On an even fftshifted grid, exact u -> -u reflection is a
+            # reversed array rolled by one bin. Plain index reversal reflects
+            # around the boundary between the two center bins instead.
+            dar = np.roll(dar, 1, axis=1)
+        elif azimuth_flip_mode != "index":
+            raise ValueError(
+                f"unknown azimuth_flip_mode {azimuth_flip_mode!r}")
     return dar
 
 
@@ -105,6 +170,32 @@ def smooth_axis(arr: np.ndarray, sigma: float, axis: int) -> np.ndarray:
     for i, row in enumerate(flat):
         out[i] = np.convolve(np.pad(row, (pad, pad), mode="edge"), kernel, mode="valid")
     return np.moveaxis(out.reshape(moved.shape), -1, axis)
+
+
+def smooth_complex_power_peak_phase(
+    arr: np.ndarray, sigma: float, axis: int,
+) -> np.ndarray:
+    """Smooth power while taking phase from the strongest local contributor."""
+    kernel = gaussian_kernel1d(sigma)
+    if kernel.size == 1:
+        return arr.astype(np.complex64, copy=False)
+    moved = np.moveaxis(arr.astype(np.complex64, copy=False), axis, -1)
+    pad = kernel.size // 2
+    padded = np.pad(
+        moved, [(0, 0)] * (moved.ndim - 1) + [(pad, pad)], mode="edge")
+    smoothed_power = np.zeros(moved.shape, dtype=np.float32)
+    best_score = np.full(moved.shape, -np.inf, dtype=np.float32)
+    best_source = np.zeros(moved.shape, dtype=np.complex64)
+    width = moved.shape[-1]
+    for offset, weight in enumerate(kernel):
+        source = padded[..., offset:offset + width]
+        score = float(weight) * np.square(np.abs(source)).astype(np.float32)
+        smoothed_power += score
+        update = score > best_score
+        best_score = np.where(update, score, best_score)
+        best_source = np.where(update, source, best_source)
+    smoothed = np.sqrt(smoothed_power) * np.exp(1j * np.angle(best_source))
+    return np.moveaxis(smoothed.astype(np.complex64), -1, axis)
 
 
 def soft_beam_weights(n_src: int, n_beams: int, sigma: float) -> np.ndarray:
@@ -199,17 +290,30 @@ def build_sample(
     cube_raz: np.ndarray,
     *,
     flip_azimuth: bool,
+    azimuth_flip_mode: str,
     target_azimuth_bins: int,
     a8_reducer: str,
     beam_sigma: float,
     aperture_start: int,
     range_smooth: float,
     az_smooth: float,
+    spatial_smooth_mode: str,
     amp_scale: float,
+    amp_gamma: float,
+    amp_clip: float,
     mag_keep_frac: float,
     doppler_keep_bins: int,
-) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray], dict[str, float]]:
-    dar = to_dar(cube_raz, flip_azimuth=flip_azimuth)
+) -> tuple[
+    np.ndarray,
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+    dict[str, float | str],
+]:
+    dar = to_dar(
+        cube_raz,
+        flip_azimuth=flip_azimuth,
+        azimuth_flip_mode=azimuth_flip_mode,
+    )
     raw_mag = np.sqrt(np.abs(dar)).astype(np.float32)
     raw_views = {
         "ra": raw_mag.max(axis=0),      # [azimuth, range]
@@ -220,10 +324,23 @@ def build_sample(
 
     complex_model = reduce_azimuth(
         dar, target_azimuth_bins, a8_reducer, beam_sigma, aperture_start)
+    if spatial_smooth_mode == "power_peak_phase":
+        complex_model = smooth_complex_power_peak_phase(
+            complex_model, range_smooth, axis=2)
+        complex_model = smooth_complex_power_peak_phase(
+            complex_model, az_smooth, axis=1)
+    elif spatial_smooth_mode not in {"none", "legacy_amplitude"}:
+        raise ValueError(
+            f"unknown spatial_smooth_mode {spatial_smooth_mode!r}")
     amplitude = np.sqrt(np.abs(complex_model)).astype(np.float32)
-    amplitude = smooth_axis(amplitude, range_smooth, axis=2)
-    amplitude = smooth_axis(amplitude, az_smooth, axis=1)
-    amplitude = amplitude * float(amp_scale)
+    if spatial_smooth_mode == "legacy_amplitude":
+        amplitude = smooth_axis(amplitude, range_smooth, axis=2)
+        amplitude = smooth_axis(amplitude, az_smooth, axis=1)
+    if amp_gamma <= 0.0:
+        raise ValueError("amp_gamma must be positive.")
+    amplitude = float(amp_scale) * np.power(amplitude, float(amp_gamma))
+    if amp_clip > 0.0:
+        amplitude = np.minimum(amplitude, float(amp_clip))
     phase = ((np.angle(complex_model) + np.pi) % (2 * np.pi) - np.pi).astype(
         np.float32)
     sample = np.stack([amplitude, phase], axis=-1)[:, :, None, :, :].astype(
@@ -240,6 +357,9 @@ def build_sample(
         "mag_keep_frac": float(mag_keep_frac),
         "doppler_keep_bins": float(doppler_keep_bins),
         "azimuth_bins": float(target_azimuth_bins),
+        "amp_gamma": float(amp_gamma),
+        "amp_clip": float(amp_clip),
+        "spatial_smooth_mode": spatial_smooth_mode,
         "mag_keep_threshold": float(mag_keep_threshold),
         "mag_nonzero_frac": float(np.mean(amp_model > 0.0)),
         "mag_min": float(amp_model.min()),
@@ -257,17 +377,24 @@ def prepare_modes(
     modes: list[str],
     *,
     flip_azimuth: bool,
+    azimuth_flip_mode: str = "index",
     target_azimuth_bins: int,
     a8_reducer: str,
     beam_sigma: float,
     aperture_start: int,
     range_smooth: float,
     az_smooth: float,
-    amp_scale: float,
+    spatial_smooth_mode: str = "none",
+    amp_scale: float = 1.0,
+    amp_gamma: float = 1.0,
+    amp_clip: float = 0.0,
     crop_fraction: float = 1.0,
+    crop_source: str = "gt",
     mag_keep_frac: float = 1.0,
     doppler_keep_bins: int = 0,
     gt_path: Path | None = None,
+    gt_crop_start: int | None = None,
+    gt_ar_manifest: np.ndarray | None = None,
 ) -> list[Prepared]:
     cube = np.load(path)
     if cube.shape != (256, 256, 64):
@@ -281,7 +408,16 @@ def prepare_modes(
                 f"RADs_gt must match RADs shape {cube.shape}, got {gt_cube.shape}.")
     if not 0.0 <= crop_fraction <= 1.0:
         raise ValueError("crop_fraction must be in [0, 1].")
-    auto_start, _threshold = first_signal_index(cube)
+    if gt_cube is not None:
+        auto_start, selected_crop_source, raw_start, gt_start = select_crop_start(
+            cube, gt_cube, crop_source)
+    else:
+        raw_start, _ = first_signal_index(cube)
+        gt_start = gt_crop_start
+        if crop_source == "gt" and gt_start is not None:
+            auto_start, selected_crop_source = gt_start, "gt_manifest"
+        else:
+            auto_start, selected_crop_source = raw_start, "raw"
     prepared: list[Prepared] = []
     for mode in modes:
         if mode == "nocrop":
@@ -294,13 +430,17 @@ def prepare_modes(
         sample, raw_views, input_views, stats = build_sample(
             shifted,
             flip_azimuth=flip_azimuth,
+            azimuth_flip_mode=azimuth_flip_mode,
             target_azimuth_bins=target_azimuth_bins,
             a8_reducer=a8_reducer,
             beam_sigma=beam_sigma,
             aperture_start=aperture_start,
             range_smooth=range_smooth,
             az_smooth=az_smooth,
+            spatial_smooth_mode=spatial_smooth_mode,
             amp_scale=amp_scale,
+            amp_gamma=amp_gamma,
+            amp_clip=amp_clip,
             mag_keep_frac=mag_keep_frac,
             doppler_keep_bins=doppler_keep_bins,
         )
@@ -308,13 +448,27 @@ def prepare_modes(
         if gt_cube is not None:
             shifted_gt = shift_range_cube(gt_cube, start)
             gt_ar = np.any(
-                np.abs(to_dar(shifted_gt, flip_azimuth=flip_azimuth)) > 0,
+                np.abs(to_dar(
+                    shifted_gt,
+                    flip_azimuth=flip_azimuth,
+                    azimuth_flip_mode=azimuth_flip_mode,
+                )) > 0,
                 axis=0,
             )
             gt_polar = gt_ar.reshape(128, 2, 64, 4).max(axis=(1, 3))
+        elif gt_ar_manifest is not None:
+            gt_polar = project_gt_ar(
+                gt_ar_manifest,
+                start,
+                flip_azimuth=flip_azimuth,
+                azimuth_flip_mode=azimuth_flip_mode,
+            )
         prepared.append(Prepared(
             mode,
             start,
+            "none" if mode == "nocrop" else selected_crop_source,
+            raw_start,
+            gt_start,
             target_azimuth_bins,
             shifted,
             sample,
@@ -439,6 +593,44 @@ def imshow_invalid(ax: plt.Axes, mask: np.ndarray, title: str) -> None:
     ax.set_yticks([])
 
 
+def summarize_frame(
+    frame_path: Path,
+    prepared: list[Prepared],
+    preds: list[dict],
+    ckpt: Path,
+) -> dict:
+    summary = {
+        "frame": str(frame_path),
+        "checkpoint": str(ckpt),
+        "modes": [],
+    }
+    for col, (prep, pred) in enumerate(zip(prepared, preds)):
+        stats = {
+            "mode": prep.mode,
+            "crop_start": prep.crop_start,
+            "crop_source": prep.crop_source,
+            "raw_crop_start": prep.raw_crop_start,
+            "gt_crop_start": prep.gt_crop_start,
+            "input_stats": prep.input_stats,
+            "logit_stats": pred["logit_stats"],
+            "valid_frac_logit_gt_-1": pred["valid_frac_logit_gt_-1"],
+            "invalid_frac_logit_gt_-1": 1.0 - pred["valid_frac_logit_gt_-1"],
+            "valid_frac_logit_gt_0": pred["valid_frac_logit_gt_0"],
+            "invalid_frac_logit_gt_0": 1.0 - pred["valid_frac_logit_gt_0"],
+            "valid_frac_logit_gt_1": pred["valid_frac_logit_gt_1"],
+            "invalid_frac_logit_gt_1": 1.0 - pred["valid_frac_logit_gt_1"],
+        }
+        if prep.gt_polar is not None:
+            stats["rads_gt_note"] = (
+                "RADs_gt is sparse radar occupancy, while GRT predicts dense "
+                "LiDAR occupancy; use these scores only for relative calibration.")
+            for threshold in (-1.0, 0.0, 1.0):
+                stats[f"rads_gt_logit_gt_{threshold:g}"] = binary_metrics(
+                    pred[f"bev_polar_logit_gt_{threshold:g}"], prep.gt_polar)
+        summary["modes"].append(stats)
+    return summary
+
+
 def render_frame(
     out_path: Path,
     frame_path: Path,
@@ -470,34 +662,10 @@ def render_frame(
         constrained_layout=True,
         squeeze=False,
     )
-    summary = {
-        "frame": str(frame_path),
-        "checkpoint": str(ckpt),
-        "modes": [],
-    }
+    summary = summarize_frame(frame_path, prepared, preds, ckpt)
     for col, (prep, pred) in enumerate(zip(prepared, preds)):
-        stats = {
-            "mode": prep.mode,
-            "crop_start": prep.crop_start,
-            "input_stats": prep.input_stats,
-            "logit_stats": pred["logit_stats"],
-            "valid_frac_logit_gt_-1": pred["valid_frac_logit_gt_-1"],
-            "invalid_frac_logit_gt_-1": 1.0 - pred["valid_frac_logit_gt_-1"],
-            "valid_frac_logit_gt_0": pred["valid_frac_logit_gt_0"],
-            "invalid_frac_logit_gt_0": 1.0 - pred["valid_frac_logit_gt_0"],
-            "valid_frac_logit_gt_1": pred["valid_frac_logit_gt_1"],
-            "invalid_frac_logit_gt_1": 1.0 - pred["valid_frac_logit_gt_1"],
-        }
-        if prep.gt_polar is not None:
-            stats["rads_gt_note"] = (
-                "RADs_gt is sparse radar occupancy, while GRT predicts dense "
-                "LiDAR occupancy; use these scores only for relative calibration.")
-            for threshold in (-1.0, 0.0, 1.0):
-                stats[f"rads_gt_logit_gt_{threshold:g}"] = binary_metrics(
-                    pred[f"bev_polar_logit_gt_{threshold:g}"], prep.gt_polar)
-        summary["modes"].append(stats)
         col_title = (
-            f"{prep.mode} crop_start={prep.crop_start}\n"
+            f"{prep.mode} crop_start={prep.crop_start} source={prep.crop_source}\n"
             f"in mean/p99/max={prep.input_stats['mag_mean']:.3g}/"
             f"{prep.input_stats['mag_p99']:.3g}/{prep.input_stats['mag_max']:.3g}\n"
             f"logit min/mean/max={pred['logit_stats']['min']:.2f}/"
@@ -599,10 +767,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="GRT repository root used to import deepradar.")
     parser.add_argument("--rads-root", type=Path, default=Path("/root/autodl-tmp/data/RADs"))
     parser.add_argument("--gt-root", type=Path, default=Path("/root/autodl-tmp/data/RADs_gt"))
+    parser.add_argument(
+        "--gt-manifest",
+        type=Path,
+        help=(
+            "Optional compact manifest with per-frame GT crop starts and "
+            "native azimuth-range sparse indices. Full GT cubes take precedence."
+        ),
+    )
+    parser.add_argument(
+        "--require-gt",
+        action="store_true",
+        help="Fail instead of falling back to raw crop when GT is unavailable.",
+    )
     parser.add_argument("--frames", nargs="+", default=["100/000050", "100/000001", "101/000001"])
     parser.add_argument(
         "--modes", nargs="+", choices=["nocrop", "crop_auto"],
-        default=["nocrop", "crop_auto"],
+        default=["crop_auto"],
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--hparams", type=Path, required=True)
@@ -632,21 +813,46 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "-3 selects [253,254,255,0,1,2,3,4]."
         ),
     )
-    parser.add_argument("--range-smooth", type=float, default=1.4)
-    parser.add_argument("--az-smooth", type=float, default=0.45)
+    parser.add_argument("--range-smooth", type=float, default=0.0)
+    parser.add_argument("--az-smooth", type=float, default=0.0)
+    parser.add_argument(
+        "--spatial-smooth-mode",
+        choices=["none", "power_peak_phase", "legacy_amplitude"],
+        default="none",
+        help=(
+            "Spatial smoothing contract. 'none' matches the precomputed "
+            "training cache; 'power_peak_phase' preserves a valid complex "
+            "signal; 'legacy_amplitude' reproduces the old non-physical path."
+        ),
+    )
     parser.add_argument(
         "--crop-fraction", type=float, default=1.0,
         help="Fraction of the automatically detected empty near-range prefix to shift out.",
     )
     parser.add_argument(
-        "--amp-scale", type=float, default=7.0,
+        "--crop-source", choices=["gt", "raw"], default="gt",
+        help="Use matched RADs_gt for the crop when available; otherwise fall back to raw.",
+    )
+    parser.add_argument(
+        "--amp-scale", type=float, default=2.6245,
         help=(
-            "Magnitude scale applied after ComplexPhase conversion. The "
-            "RADs-like default 7 matches the geometric-median active-bin "
-            "magnitude ratio measured against the training cache."
+            "Fixed magnitude scale applied after the global power law; the "
+            "default was selected on the fixed 48-frame RADs calibration set."
         ),
     )
     parser.add_argument("--mag-keep-frac", type=float, default=1.0)
+    parser.add_argument(
+        "--amp-gamma", type=float, default=0.45,
+        help=(
+            "Global magnitude power-law exponent; the default was selected "
+            "on the fixed 48-frame RADs calibration set and is never "
+            "estimated per frame."
+        ),
+    )
+    parser.add_argument(
+        "--amp-clip", type=float, default=0.0,
+        help="Optional fixed post-scale magnitude ceiling; 0 disables clipping.",
+    )
     parser.add_argument(
         "--doppler-keep-bins", type=int, default=11,
         help=(
@@ -655,12 +861,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "occupies exactly the centered 11 of 64 bins."
         ),
     )
+    parser.add_argument(
+        "--azimuth-flip-mode",
+        choices=["index", "spectral"],
+        default="index",
+        help=(
+            "'index' reproduces the established RADs convention; 'spectral' "
+            "uses exact centered-frequency reflection on an even grid."
+        ),
+    )
     parser.add_argument("--no-flip-azimuth", action="store_true")
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Compute JSON metrics without rendering PNGs or saving prediction arrays.",
+    )
     return parser.parse_args(argv)
 
 
 def main() -> int:
     args = parse_args()
+    args.out_dir.mkdir(parents=True, exist_ok=True)
 
     repo = args.repo.resolve()
     if str(repo) not in sys.path:
@@ -677,6 +898,14 @@ def main() -> int:
     model.eval().to(device)
     if device.type == "cuda":
         torch.cuda.empty_cache()
+
+    gt_manifest_frames: dict[str, dict] = {}
+    if args.gt_manifest is not None:
+        gt_manifest_payload = json.loads(args.gt_manifest.read_text())
+        if gt_manifest_payload.get("native_ar_shape") != [256, 256]:
+            raise ValueError(
+                "GT manifest native_ar_shape must be [256,256].")
+        gt_manifest_frames = gt_manifest_payload["frames"]
 
     if args.input_azimuth_bins == "auto":
         target_azimuth_bins = int(getattr(model.encoder, "azimuth_bins", 8))
@@ -695,21 +924,25 @@ def main() -> int:
         "repo": str(repo),
         "rads_root": str(args.rads_root),
         "gt_root": str(args.gt_root),
+        "gt_manifest": str(args.gt_manifest) if args.gt_manifest else None,
         "out_dir": str(args.out_dir),
         "checkpoint": str(args.checkpoint),
         "hparams": str(args.hparams),
         "device": str(device),
         "input_azimuth_bins": target_azimuth_bins,
         "crop_fraction": args.crop_fraction,
+        "crop_source": args.crop_source,
         "a8_reducer": args.a8_reducer if target_azimuth_bins == 8 else None,
         "aperture_start": args.aperture_start if target_azimuth_bins == 8 else None,
         "doppler_keep_bins": args.doppler_keep_bins,
+        "azimuth_flip": not args.no_flip_azimuth,
+        "azimuth_flip_mode": args.azimuth_flip_mode,
         "frames": [],
         "notes": [
             "RADs arrays are treated as [range, azimuth, doppler].",
-            "RADs inference renders nocrop and crop_auto by default because the best range alignment is checkpoint-dependent.",
-            "crop_auto shifts the whole 3D RAD cube along range before any RA/RD/AD/model input derivation.",
-            "RADs-like defaults keep the centered 11/64 Doppler bins and use amplitude scale 7, calibrated against the training cache.",
+            "RADs inference uses crop_auto by default.",
+            "crop_auto shifts the whole 3D RAD cube along range before any RA/RD/AD/model input derivation; matched RADs_gt is preferred and raw detection is only a fallback.",
+            "RADs-like defaults keep the centered 11/64 Doppler bins, disable spatial smoothing, and use the fixed gamma=0.45/scale=2.6245 magnitude calibration.",
             f"Model input is [D,A,E,R,C]=[64,{target_azimuth_bins},1,256,2], "
             "where C=(sqrt(abs(complex)), phase).",
             "A256 checkpoints retain the cropped RADs azimuth axis directly; "
@@ -721,54 +954,85 @@ def main() -> int:
     for frame in args.frames:
         rel = Path(frame)
         frame_path = args.rads_root / rel.parent / f"{rel.name}.npy"
+        manifest_entry = gt_manifest_frames.get(rel.as_posix())
+        gt_ar_manifest = None
+        gt_crop_start = None
+        if manifest_entry is not None:
+            gt_crop_start = int(manifest_entry["crop_start"])
+            gt_ar_manifest = np.zeros((256, 256), dtype=bool)
+            gt_ar_manifest.flat[
+                np.asarray(manifest_entry["ar_indices"], dtype=np.int64)
+            ] = True
+        gt_path = args.gt_root / rel.parent / f"{rel.name}.npy"
+        if args.require_gt and not gt_path.exists() and manifest_entry is None:
+            raise FileNotFoundError(
+                f"GT required but unavailable for {rel.as_posix()}")
         prepared = prepare_modes(
             frame_path,
             args.modes,
             flip_azimuth=not args.no_flip_azimuth,
+            azimuth_flip_mode=args.azimuth_flip_mode,
             target_azimuth_bins=target_azimuth_bins,
             a8_reducer=args.a8_reducer,
             beam_sigma=args.beam_sigma,
             aperture_start=args.aperture_start,
             range_smooth=args.range_smooth,
             az_smooth=args.az_smooth,
+            spatial_smooth_mode=args.spatial_smooth_mode,
             amp_scale=args.amp_scale,
+            amp_gamma=args.amp_gamma,
+            amp_clip=args.amp_clip,
             crop_fraction=args.crop_fraction,
+            crop_source=args.crop_source,
             mag_keep_frac=args.mag_keep_frac,
             doppler_keep_bins=args.doppler_keep_bins,
-            gt_path=args.gt_root / rel.parent / f"{rel.name}.npy",
+            gt_path=gt_path,
+            gt_crop_start=gt_crop_start,
+            gt_ar_manifest=gt_ar_manifest,
         )
         preds = [infer_one(model, prep, device) for prep in prepared]
         out_name = (
             f"rads_{rel.parent.name}_{rel.name}_map_ckpt_"
             f"a{target_azimuth_bins}_crop_compare.png")
-        summary = render_frame(args.out_dir / out_name, frame_path, prepared, preds, args.checkpoint)
-        for prep, pred in zip(prepared, preds):
-            arrays_path = args.out_dir / (
-                f"rads_{rel.parent.name}_{rel.name}_{prep.mode}_predictions.npz"
+        if args.summary_only:
+            summary = summarize_frame(
+                frame_path, prepared, preds, args.checkpoint)
+        else:
+            summary = render_frame(
+                args.out_dir / out_name,
+                frame_path,
+                prepared,
+                preds,
+                args.checkpoint,
             )
-            np.savez_compressed(
-                arrays_path,
-                crop_start=np.asarray(prep.crop_start, dtype=np.int16),
-                bev_polar_prob_maxe=pred["bev_polar_prob_maxe"].astype(np.float16),
-                bev_polar_logit_gt_m1=pred["bev_polar_logit_gt_-1"].astype(np.uint8),
-                bev_polar_logit_gt_0=pred["bev_polar_logit_gt_0"].astype(np.uint8),
-                bev_polar_logit_gt_1=pred["bev_polar_logit_gt_1"].astype(np.uint8),
-                depth_logit_gt_m1=pred["depth_logit_gt_-1"].astype(np.float16),
-                depth_logit_gt_0=pred["depth_logit_gt_0"].astype(np.float16),
-                depth_logit_gt_1=pred["depth_logit_gt_1"].astype(np.float16),
-                invalid_mask_logit_gt_m1=pred["invalid_mask_logit_gt_-1"].astype(np.uint8),
-                invalid_mask_logit_gt_0=pred["invalid_mask_logit_gt_0"].astype(np.uint8),
-                invalid_mask_logit_gt_1=pred["invalid_mask_logit_gt_1"].astype(np.uint8),
-                input_azimuth_bins=np.asarray(prep.azimuth_bins, dtype=np.int16),
-                gt_polar=(
-                    prep.gt_polar.astype(np.uint8)
-                    if prep.gt_polar is not None
-                    else np.empty((0, 0), dtype=np.uint8)
-                ),
-            )
-            print("ARRAYS", arrays_path, flush=True)
+            for prep, pred in zip(prepared, preds):
+                arrays_path = args.out_dir / (
+                    f"rads_{rel.parent.name}_{rel.name}_{prep.mode}_predictions.npz"
+                )
+                np.savez_compressed(
+                    arrays_path,
+                    crop_start=np.asarray(prep.crop_start, dtype=np.int16),
+                    bev_polar_prob_maxe=pred["bev_polar_prob_maxe"].astype(np.float16),
+                    bev_polar_logit_gt_m1=pred["bev_polar_logit_gt_-1"].astype(np.uint8),
+                    bev_polar_logit_gt_0=pred["bev_polar_logit_gt_0"].astype(np.uint8),
+                    bev_polar_logit_gt_1=pred["bev_polar_logit_gt_1"].astype(np.uint8),
+                    depth_logit_gt_m1=pred["depth_logit_gt_-1"].astype(np.float16),
+                    depth_logit_gt_0=pred["depth_logit_gt_0"].astype(np.float16),
+                    depth_logit_gt_1=pred["depth_logit_gt_1"].astype(np.float16),
+                    invalid_mask_logit_gt_m1=pred["invalid_mask_logit_gt_-1"].astype(np.uint8),
+                    invalid_mask_logit_gt_0=pred["invalid_mask_logit_gt_0"].astype(np.uint8),
+                    invalid_mask_logit_gt_1=pred["invalid_mask_logit_gt_1"].astype(np.uint8),
+                    input_azimuth_bins=np.asarray(prep.azimuth_bins, dtype=np.int16),
+                    gt_polar=(
+                        prep.gt_polar.astype(np.uint8)
+                        if prep.gt_polar is not None
+                        else np.empty((0, 0), dtype=np.uint8)
+                    ),
+                )
+                print("ARRAYS", arrays_path, flush=True)
         all_summary["frames"].append(summary)
-        print("SAVED", args.out_dir / out_name, flush=True)
+        if not args.summary_only:
+            print("SAVED", args.out_dir / out_name, flush=True)
         print("SUMMARY", json.dumps(summary["modes"]), flush=True)
         if device.type == "cuda":
             torch.cuda.empty_cache()

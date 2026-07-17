@@ -40,11 +40,11 @@ inverse up to floating-point error. The sector reducers remain useful empirical
 baselines for pseudo-angular RADs data, but they do not invert the training
 transform.
 
-The RADs audit found a boundary-straddling effective aperture. A window learned
-from sequence 100 selected circular indices `[253,254,255,0,1,2,3,4]`, rather
-than `[0..7]`. Use `aperture_window --aperture-start -3` for this globally
-calibrated contract. Do not search the window independently for each evaluation
-frame; calibration and evaluation sequences must remain disjoint.
+A preliminary three-frame audit found a boundary-straddling effective aperture,
+but a controlled comparison on the fixed frames did not improve transfer over
+the algebraically matched `[0..7]` aperture. Keep `aperture_truncate` as the
+default. `aperture_window` remains an explicit ablation only; do not search its
+start independently for each evaluation frame.
 
 ## A256 Model Path
 
@@ -96,12 +96,77 @@ python scripts/rads_map_checkpoint_infer.py \
 `auto` resolves to A256 for `AzimuthFFTTransformerEncoder` checkpoints and A8
 for the original `TransformerEncoder`.
 
+### Full RADs crop audit
+
+The crop contract was checked on all 583 locally paired `RADs`/`RADs_gt`
+frames. The raw signal detector selected a start one bin before the first GT
+return on 428 frames and two bins before it on 155 frames. It was never exact:
+
+- raw start median: 65;
+- GT start median: 67;
+- raw minus GT: always -1 or -2;
+- agreement within two bins: 100%.
+
+`rads_map_checkpoint_infer.py` therefore uses the matched `RADs_gt` first return
+by default and falls back to the raw detector only when GT is unavailable.
+`--crop-source raw` remains available for controlled comparisons. Cropping is
+still applied to the complete complex 3D cube before any RA, RD, AD, model
+input, or GT projection is computed. The reproducible audit is
+`scripts/audit_rads_crop_contract.py`.
+
+The former inference path also Gaussian-smoothed only the stored magnitude
+while retaining phase from the unsmoothed complex cube. Such a magnitude/phase
+pair does not describe a valid complex signal and does not match the
+precomputed training cache. Spatial smoothing is now disabled by default.
+The optional `power_peak_phase` mode smooths power and copies phase from the
+strongest local contributor; `legacy_amplitude` exists only to reproduce old
+figures. Global `amp_gamma` and `amp_clip` controls are exposed for fixed,
+dataset-level calibration and must not be estimated independently per frame.
+
+### Fixed 48-frame input-contract ablation
+
+Seven input contracts were compared on 48 fixed frames from sequences 100 and
+101 with the same checkpoint, GT crop, centered 11-bin Doppler support, and
+the same sparse RADs radar GT. Paired 20,000-sample frame bootstrap showed that
+the old `gamma=1, scale=7` calibration was materially worse than the fixed
+`gamma=0.45, scale=2.6245` calibration:
+
+- `logit > -1` F1 increased by `0.00360`, 95% CI `[0.00234, 0.00482]`;
+- `logit > 0` F1 increased by `0.00630`, 95% CI `[0.00464, 0.00801]`;
+- `gamma=0.45` also beat `gamma=0.367` at both thresholds;
+- `gamma=0.50` improved only the loose threshold and slightly reduced the
+  stricter `logit > 0` score, so `0.45` is the balanced default;
+- exact spectral reflection did not significantly improve on the established
+  index flip, while disabling the flip reduced `logit > -1` F1;
+- spatial smoothing improved sparse-GT overlap on three frames but visibly
+  collapsed depth toward a low-frequency scene template, so it is rejected as
+  the production default.
+
+The retained RADs inference contract is therefore: GT whole-cube range crop,
+no spatial smoothing, fixed `gamma=0.45/scale=2.6245`, centered 11-bin Doppler
+support, `aperture_truncate`, and the established index flip. The comparison
+scripts are `scripts/summarize_rads_input_ablation.py` and
+`scripts/compare_rads_ablation_cases.py`. Absolute sparse-GT F1 remains a
+relative transfer diagnostic because the model target is dense LiDAR
+occupancy, not sparse radar returns.
+
 ## Best Verified Model-Selection Run
 
-The best A256/E1 occupancy checkpoint produced on AutoDL is
-`best-primary-017-9000.ckpt` (SHA256
-`9572fa71a3a1434073a174c50a892604b625a101ae3dac832463e17d7b6a48b3`).
-Its validation `map_f1` is `0.29325`.
+The original model-selection checkpoint is `best-primary-017-9000.ckpt`
+(SHA256
+`9572fa71a3a1434073a174c50a892604b625a101ae3dac832463e17d7b6a48b3`) with
+validation `map_f1=0.29325`. A full-data continuation using the corrected,
+power-preserving Doppler cache reached a new primary best at step 16,000:
+
+- `map_f1=0.29940`;
+- first-hit depth MAE `5.72382` range bins;
+- Chamfer `1.78872`;
+- `logit > 1` F1 `0.39084`.
+
+This improves on the original checkpoint's `map_f1=0.29325`, depth MAE
+`6.98815`, Chamfer `2.10486`, and `logit > 1` F1 `0.36393`. Later checkpoints
+continued reducing train loss but validation F1 declined, so step 16,000 is
+the retained checkpoint and later checkpoints are overfit.
 
 The run used:
 
@@ -120,26 +185,37 @@ cap therefore consumed only 16,000 samples (2.86%) per short epoch. This
 checkpoint is a strong initialization and model-selection result, not proof of
 complete full-dataset optimization.
 
-## Recommended Full-Data Continuation
+## Full-Data Continuation Status
 
-The next baseline should continue from the step-9000 checkpoint with the full
-train dataloader. Do not restart from official weights and do not add seam or
-refiner losses: all three output-smoothing ablations reduced validation F1.
+The full 558,902-sample training split has now been covered using batch size
+32, accumulation 1, bf16 mixed precision, the corrected power-preserving
+Doppler cache, and the deterministic 2,048-sample validation subset. One full
+epoch contains 17,465 optimizer steps. The primary metric peaked at step 16,000
+and subsequently declined while train loss continued to fall. This is genuine
+overfitting rather than an epoch-number bookkeeping issue.
 
-Recommended first run:
+The controlled low-learning-rate continuation was run from the retained
+step-16,000 checkpoint at `2e-5`, with validation every 2,000 optimizer steps.
+It changed no input, label, batch, or validation contract. The primary metric
+peaked after 4,000 additional steps:
 
-- batch size 32, accumulation 1, bf16 mixed precision;
-- AdamW learning rate `2e-5`, warmup 250;
-- no `limit_train_batches`;
-- three full epochs (or a four-hour maximum), validation once per epoch;
-- retain the 2048-sample deterministic validation subset;
-- select primarily by `map_f1/val`, while also saving best loss, depth, and
-  `logit > 1` F1 checkpoints;
-- keep augmentation disabled for this controlled coverage experiment. Test
-  augmentation separately only after establishing the full-data baseline.
+- `map_f1`: `0.29940 -> 0.30212`
+- first-hit depth MAE: `5.724 -> 5.621` range bins
+- Chamfer: `1.789 -> 1.757`
+- precision/recall: `0.1931 / 0.7125`
 
-On the verified cache, one full epoch contains 17,465 optimizer steps. Recheck
-the actual dataloader length at launch if the trace set or batch size changes.
+The 6,000-step checkpoint retained a slightly better high-threshold F1 but
+reduced the primary F1 to `0.30102`; retain
+`best-primary-001-4000.ckpt` as the new primary model.
+
+On the fixed 48-frame RADs transfer set, the same checkpoint improved sparse
+GT F1 at both tested thresholds. At `logit > -1`, mean F1 increased from
+`0.01124` to `0.01260` (paired bootstrap 95% CI for the delta
+`[0.00097, 0.00178]`); at `logit > 0`, it increased from `0.01302` to
+`0.01447` (`[0.00088, 0.00209]`). The predicted-positive fraction fell by
+`0.0507` and `0.0259`, respectively, while recall changes were not
+statistically significant. The gain therefore comes from fewer false
+positives, not from suppressing all RADs responses.
 
 ## Failed Visibility-Only Supervision Ablation
 
@@ -232,22 +308,36 @@ ablation.
 
 `scripts/audit_rads_iq1m_input_distribution.py` compares model-input power
 profiles and phase statistics on matched A8 tensors. On 512 held-out I/Q-1M
-frames and 32 evenly sampled RADs frames:
+frames and 32 evenly sampled RADs frames, followed by a no-smoothing recheck
+under the corrected crop contract:
 
 - azimuth was the closest axis (`JS=0.082` for power-preserving I/Q-1M versus
   cropped RADs), supporting the matched aperture projection;
 - Doppler still differed (`JS=0.230`): RADs had about three active bins while
   the checkpoint-compatible I/Q-1M transform had eleven;
-- range differed most structurally (`JS=0.273`): after valid near-range
-  cropping, RADs power had median/95th-percentile bins `5/18`, versus `39/249`
-  for I/Q-1M;
-- the A256 RADs tensor lost about `61.5%` relative L2 energy after fixed
-  A8 projection and re-expansion.
+- range differed most structurally (`JS=0.253` in the no-smoothing recheck):
+  after valid near-range cropping, RADs power had median/95th-percentile bins
+  `5/28`, versus `39/249` for I/Q-1M;
+- fixed first-eight aperture projection retains about `58.1%` of RADs energy,
+  while a sequence-disjoint complex PCA rank-8 basis retains more than `99.5%`.
 
 A partial near-range shift was also rejected. With `crop_fraction=0.5`, the
 RADs-to-power-I/Q-1M range JS divergence increased from `0.273` to `0.427`.
 Keep the full automatically detected shift for the complete 3D cube; matching
 only the median range bin does not match the full range-energy distribution.
+
+### Range-coordinate limitation
+
+I/Q-1M outdoor metadata defines `range_resolution=0.0873772077 m/bin`, so its
+256 radar range bins cover about `22.37 m`. The available RADs and `RADs_gt`
+files are both index-space tensors with shape `[256,256,64]`; `RADs_gt` is a
+binary `uint8` cube and contains no bin-to-meter metadata. The current RADs
+crop is therefore a verified index-space alignment, not a verified metric
+range alignment. Do not resample RADs range to I/Q-1M meters, or report metric
+depth transfer, until the RADs simulator configuration provides range
+resolution and the range-axis origin. The occupancy objective's
+`max_range=64 m` specifies the LiDAR output grid and must not be reused as the
+RADs radar-input span.
 
 The last result does not by itself justify a VAE. A sequence-disjoint complex
 PCA rank-8 basis retained more than 99% of RADs energy, so the bottleneck is not

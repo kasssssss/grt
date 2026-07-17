@@ -12,6 +12,12 @@ from models.grt import (
     ResidualRefinedTransformerDecoder,
     TransformerDecoder,
 )
+from scripts.rads_map_checkpoint_infer import (
+    project_gt_ar,
+    select_crop_start,
+    smooth_complex_power_peak_phase,
+    to_dar,
+)
 
 
 def make_encoder(azimuth_bins: int = 256) -> AzimuthFFTTransformerEncoder:
@@ -52,6 +58,62 @@ def test_a8_to_a256_matches_aperture_zero_padding() -> None:
 def test_a256_input_is_not_modified() -> None:
     value = torch.randn(1, 2, 256, 1, 4, 2)
     assert make_encoder().expand_azimuth(value) is value
+
+
+def test_rads_crop_prefers_matched_gt_and_raw_is_explicit_fallback() -> None:
+    cube = np.zeros((8, 4, 3), dtype=np.complex64)
+    cube[2, 1, 1] = 10.0 + 0.0j
+    gt = np.zeros(cube.shape, dtype=np.uint8)
+    gt[4, 2, 1] = 1
+
+    assert select_crop_start(cube, gt, "gt") == (4, "gt", 2, 4)
+    assert select_crop_start(cube, gt, "raw") == (2, "raw", 2, 4)
+    assert select_crop_start(cube, None, "gt") == (2, "raw", 2, None)
+
+
+def test_power_peak_phase_smoothing_preserves_power_and_peak_phase() -> None:
+    value = np.zeros((1, 1, 9), dtype=np.complex64)
+    phase = 0.7
+    value[0, 0, 4] = 2.0 * np.exp(1j * phase)
+    actual = smooth_complex_power_peak_phase(value, sigma=1.0, axis=2)
+
+    np.testing.assert_allclose(
+        np.square(np.abs(actual)).sum(),
+        np.square(np.abs(value)).sum(),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    active = np.abs(actual) > 0
+    np.testing.assert_allclose(
+        np.angle(actual[active]), phase, rtol=1e-6, atol=1e-6)
+
+
+def test_azimuth_flip_modes_have_explicit_even_grid_contract() -> None:
+    cube = np.arange(8, dtype=np.float32).reshape(1, 8, 1).astype(np.complex64)
+    index = to_dar(cube, flip_azimuth=True, azimuth_flip_mode="index")
+    spectral = to_dar(cube, flip_azimuth=True, azimuth_flip_mode="spectral")
+    unflipped = to_dar(cube, flip_azimuth=False, azimuth_flip_mode="spectral")
+
+    np.testing.assert_array_equal(index[0, :, 0], np.arange(7, -1, -1))
+    np.testing.assert_array_equal(spectral, np.roll(index, 1, axis=1))
+    np.testing.assert_array_equal(unflipped[0, :, 0], np.arange(8))
+
+
+def test_compact_gt_projection_obeys_crop_and_flip_contract() -> None:
+    gt_ar = np.zeros((256, 256), dtype=bool)
+    gt_ar[2, 4] = True
+
+    unflipped = project_gt_ar(
+        gt_ar, 4, flip_azimuth=False, azimuth_flip_mode="index")
+    index = project_gt_ar(
+        gt_ar, 4, flip_azimuth=True, azimuth_flip_mode="index")
+    spectral = project_gt_ar(
+        gt_ar, 4, flip_azimuth=True, azimuth_flip_mode="spectral")
+
+    assert unflipped[1, 0]
+    assert index[126, 0]
+    assert spectral[127, 0]
+    assert unflipped.sum() == index.sum() == spectral.sum() == 1
 
 
 def test_azimuth_shrink_requires_an_explicit_reducer() -> None:

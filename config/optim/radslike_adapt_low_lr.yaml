@@ -1,0 +1,7 @@
+# Controlled continuation after the full-data RADs-like run reached its
+# validation optimum. This changes only the optimizer trajectory.
+optimizer:
+  name: AdamW
+  default_lr: 0.00002
+  warmup: 250
+  subsets: {}
