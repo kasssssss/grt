@@ -1,0 +1,32 @@
+# Physical-span RADs-like ablation without coherent phase cancellation.
+# I/Q-1M only observes about [-1.22,1.18] m/s, so unobserved target bins remain
+# zero. RMS magnitude preserves source scale; phase comes from the strongest
+# source bin at each voxel. No Gaussian energy is copied into unobserved speeds.
+dataset:
+  channels:
+    radar:
+      args:
+        :transform:
+        - name: AssertTx2
+          args: {}
+        - name: IIQQtoIQ
+          args:
+            scale: 0.001
+        - name: FFTArray
+          args:
+            pad: 0
+            axes: [0, 1, 2, 3]
+        - name: RADsLikeDoppler
+          args:
+            target_bins: 64
+            target_max_speed: 90.0
+            elevation_index: 0
+            mapping: physical
+            merge: rms_peak_phase
+            smooth_sigma_bins: 0.0
+        - name: ComplexPhase
+          args: {}
+
+encoder:
+  args:
+    :patch: [2, 8, 1, 4]

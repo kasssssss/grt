@@ -13,7 +13,8 @@ COMMON_CFG=${COMMON_CFG:-"grt/grt.yaml grt/small.yaml data/outdoor.yaml repr/rad
 EPOCHS=${EPOCHS:-200}
 PATIENCE=${PATIENCE:-12}
 WORKERS=${WORKERS:-8}
-ACCUMULATE=${ACCUMULATE:-4}
+# The validated A256 model-selection run used batch 32 without accumulation.
+ACCUMULATE=${ACCUMULATE:-1}
 LOG_INTERVAL=${LOG_INTERVAL:-25}
 LOG_EXAMPLE_INTERVAL=${LOG_EXAMPLE_INTERVAL:-250}
 NUM_CHECKPOINTS=${NUM_CHECKPOINTS:-1}

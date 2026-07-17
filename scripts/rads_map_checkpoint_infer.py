@@ -116,7 +116,11 @@ def soft_beam_weights(n_src: int, n_beams: int, sigma: float) -> np.ndarray:
 
 
 def reduce_azimuth(
-    dar: np.ndarray, target_bins: int, mode: str, beam_sigma: float
+    dar: np.ndarray,
+    target_bins: int,
+    mode: str,
+    beam_sigma: float,
+    aperture_start: int = 0,
 ) -> np.ndarray:
     """Reduce pseudo-A256 RADs azimuth while retaining complex phase."""
     if dar.shape[1] == target_bins:
@@ -124,6 +128,24 @@ def reduce_azimuth(
     if target_bins != 8 or dar.shape[1] % target_bins != 0:
         raise ValueError(
             f"Unsupported azimuth reduction A={dar.shape[1]} -> A={target_bins}.")
+    if mode == "aperture_truncate":
+        # The RADs-like I/Q-1M A256 path zero-pads an eight-element aperture
+        # before the azimuth FFT. Its matched projection is the inverse
+        # operation, not averaging neighboring angular bins.
+        aperture = np.fft.ifft(
+            np.fft.ifftshift(dar, axes=1), axis=1)
+        aperture8 = aperture[:, :target_bins, :]
+        return np.fft.fftshift(
+            np.fft.fft(aperture8, axis=1), axes=1
+        ).astype(np.complex64)
+    if mode == "aperture_window":
+        aperture = np.fft.ifft(
+            np.fft.ifftshift(dar, axes=1), axis=1)
+        indices = (aperture_start + np.arange(target_bins)) % aperture.shape[1]
+        aperture8 = aperture[:, indices, :]
+        return np.fft.fftshift(
+            np.fft.fft(aperture8, axis=1), axes=1
+        ).astype(np.complex64)
     if mode == "gaussian_coherent":
         weights = soft_beam_weights(dar.shape[1], target_bins, beam_sigma)
         return np.einsum("ba,dar->dbr", weights, dar, optimize=True).astype(
@@ -180,6 +202,7 @@ def build_sample(
     target_azimuth_bins: int,
     a8_reducer: str,
     beam_sigma: float,
+    aperture_start: int,
     range_smooth: float,
     az_smooth: float,
     amp_scale: float,
@@ -196,7 +219,7 @@ def build_sample(
     dar = keep_center_doppler(dar, doppler_keep_bins)
 
     complex_model = reduce_azimuth(
-        dar, target_azimuth_bins, a8_reducer, beam_sigma)
+        dar, target_azimuth_bins, a8_reducer, beam_sigma, aperture_start)
     amplitude = np.sqrt(np.abs(complex_model)).astype(np.float32)
     amplitude = smooth_axis(amplitude, range_smooth, axis=2)
     amplitude = smooth_axis(amplitude, az_smooth, axis=1)
@@ -237,6 +260,7 @@ def prepare_modes(
     target_azimuth_bins: int,
     a8_reducer: str,
     beam_sigma: float,
+    aperture_start: int,
     range_smooth: float,
     az_smooth: float,
     amp_scale: float,
@@ -273,6 +297,7 @@ def prepare_modes(
             target_azimuth_bins=target_azimuth_bins,
             a8_reducer=a8_reducer,
             beam_sigma=beam_sigma,
+            aperture_start=aperture_start,
             range_smooth=range_smooth,
             az_smooth=az_smooth,
             amp_scale=amp_scale,
@@ -585,16 +610,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--beam-sigma", type=float, default=18.0)
     parser.add_argument(
-        "--input-azimuth-bins", choices=["auto", "8", "256"], default="auto")
+        "--input-azimuth-bins", choices=["auto", "8", "256"], default="8")
     parser.add_argument(
         "--a8-reducer",
         choices=[
+            "aperture_truncate",
+            "aperture_window",
             "gaussian_coherent",
             "sector_coherent",
             "sector_energy_circular",
             "sector_max_energy",
         ],
-        default="sector_max_energy",
+        default="aperture_truncate",
+    )
+    parser.add_argument(
+        "--aperture-start",
+        type=int,
+        default=0,
+        help=(
+            "Circular aperture-window start used by aperture_window; "
+            "-3 selects [253,254,255,0,1,2,3,4]."
+        ),
     )
     parser.add_argument("--range-smooth", type=float, default=1.4)
     parser.add_argument("--az-smooth", type=float, default=0.45)
@@ -666,6 +702,7 @@ def main() -> int:
         "input_azimuth_bins": target_azimuth_bins,
         "crop_fraction": args.crop_fraction,
         "a8_reducer": args.a8_reducer if target_azimuth_bins == 8 else None,
+        "aperture_start": args.aperture_start if target_azimuth_bins == 8 else None,
         "doppler_keep_bins": args.doppler_keep_bins,
         "frames": [],
         "notes": [
@@ -691,6 +728,7 @@ def main() -> int:
             target_azimuth_bins=target_azimuth_bins,
             a8_reducer=args.a8_reducer,
             beam_sigma=args.beam_sigma,
+            aperture_start=args.aperture_start,
             range_smooth=args.range_smooth,
             az_smooth=args.az_smooth,
             amp_scale=args.amp_scale,

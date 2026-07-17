@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cache-dtype", choices=["float32", "float16"], default="float32")
     p.add_argument("--limit-per-trace", type=int, default=None)
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--traces", nargs="*", default=None)
     p.add_argument(
         "--configs",
         nargs="+",
@@ -131,6 +132,9 @@ def load_precompute_config(repo: Path, configs: list[str]) -> dict[str, Any]:
         "target_max_speed": float(rads_like.get("target_max_speed", 90.0)),
         "elevation_indices": elevation_indices,
         "merge": str(rads_like.get("merge", "mean")),
+        "mapping": str(rads_like.get("mapping", "physical")),
+        "smooth_mode": str(rads_like.get("smooth_mode", "complex")),
+        "output_scale": float(rads_like.get("output_scale", 1.0)),
         "smooth_sigma_bins": float(rads_like.get("smooth_sigma_bins", 0.0)),
     }
 
@@ -161,10 +165,23 @@ def discover_traces(repo: Path, data_root: Path, cfg: dict[str, Any]) -> list[Tr
     return traces
 
 
-def build_target_index(source_bins: int, doppler_res: float, target_bins: int, target_max_speed: float) -> tuple[torch.Tensor, torch.Tensor]:
-    source_velocity = (np.arange(source_bins, dtype=np.float32) - source_bins // 2) * doppler_res
-    target_res = 2.0 * target_max_speed / target_bins
-    target_index = np.rint(source_velocity / target_res + target_bins // 2).astype(np.int64)
+def build_target_index(
+    source_bins: int,
+    doppler_res: float,
+    target_bins: int,
+    target_max_speed: float,
+    mapping: str = "physical",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if mapping == "native_index":
+        if target_bins != source_bins:
+            raise ValueError("native_index mapping requires target_bins == source_bins")
+        target_index = np.arange(source_bins, dtype=np.int64)
+    elif mapping == "physical":
+        source_velocity = (np.arange(source_bins, dtype=np.float32) - source_bins // 2) * doppler_res
+        target_res = 2.0 * target_max_speed / target_bins
+        target_index = np.rint(source_velocity / target_res + target_bins // 2).astype(np.int64)
+    else:
+        raise ValueError(f"Unsupported mapping={mapping!r}")
     counts = np.zeros(target_bins, dtype=np.int64)
     for target_idx in target_index:
         if 0 <= target_idx < target_bins:
@@ -193,6 +210,8 @@ def preprocess_batch(
     elevation_indices: list[int],
     merge: str,
     smooth_kernel: torch.Tensor | None,
+    smooth_mode: str,
+    output_scale: float,
 ) -> np.ndarray:
     raw = raw.to(device=device, non_blocking=True)
     if raw.ndim != 5:
@@ -228,24 +247,49 @@ def preprocess_batch(
 
     target_index = target_index_cpu.to(device=device)
     counts = counts_cpu.to(device=device)
-    for source_idx in range(source_bins):
-        target_idx = int(target_index[source_idx].item())
-        if 0 <= target_idx < target_bins:
-            target[:, target_idx] += kept[:, source_idx]
-
-    if merge == "mean":
-        nonzero = counts > 0
-        target[:, nonzero] = target[:, nonzero] / counts[nonzero][None, :, None, None, None]
-    elif merge != "sum":
-        raise ValueError(f"Unsupported merge={merge!r}")
+    if merge == "rms_peak_phase":
+        for target_idx in torch.nonzero(counts > 0, as_tuple=False).flatten().tolist():
+            source = torch.nonzero(target_index == target_idx, as_tuple=False).flatten()
+            group = kept.index_select(1, source)
+            amplitude = torch.sqrt(torch.mean(torch.square(torch.abs(group)), dim=1))
+            peak_index = torch.argmax(torch.abs(group), dim=1, keepdim=True)
+            peak = torch.gather(group, 1, peak_index).squeeze(1)
+            target[:, target_idx] = torch.polar(amplitude, torch.angle(peak))
+    else:
+        for source_idx in range(source_bins):
+            target_idx = int(target_index[source_idx].item())
+            if 0 <= target_idx < target_bins:
+                target[:, target_idx] += kept[:, source_idx]
+        if merge == "mean":
+            nonzero = counts > 0
+            target[:, nonzero] = target[:, nonzero] / counts[nonzero][None, :, None, None, None]
+        elif merge != "sum":
+            raise ValueError(f"Unsupported merge={merge!r}")
 
     if smooth_kernel is not None:
         radius = smooth_kernel.numel() // 2
         padded = F.pad(target, (0, 0, 0, 0, 0, 0, radius, radius))
-        smoothed = torch.zeros_like(target)
-        for i, weight in enumerate(smooth_kernel):
-            smoothed += weight * padded[:, i:i + target_bins]
-        target = smoothed
+        if smooth_mode == "complex":
+            smoothed = torch.zeros_like(target)
+            for i, weight in enumerate(smooth_kernel):
+                smoothed += weight * padded[:, i:i + target_bins]
+            target = smoothed
+        elif smooth_mode == "power_peak_phase":
+            smoothed_power = torch.zeros_like(target.real)
+            best_score = torch.zeros_like(target.real)
+            best_source = torch.zeros_like(target)
+            for i, weight in enumerate(smooth_kernel):
+                source = padded[:, i:i + target_bins]
+                score = weight * torch.square(torch.abs(source))
+                smoothed_power += score
+                update = score > best_score
+                best_score = torch.where(update, score, best_score)
+                best_source = torch.where(update, source, best_source)
+            target = torch.polar(torch.sqrt(smoothed_power), torch.angle(best_source))
+        else:
+            raise ValueError(f"Unsupported smooth_mode={smooth_mode!r}")
+
+    target *= output_scale
 
     magnitude = torch.sqrt(torch.abs(target))
     phase = torch.angle(target)
@@ -302,6 +346,7 @@ def worker_main(rank: int, args_dict: dict[str, Any], traces_payload: list[dict[
             doppler_res=float(radar_meta["doppler_resolution"]),
             target_bins=cfg["target_bins"],
             target_max_speed=cfg["target_max_speed"],
+            mapping=cfg["mapping"],
         )
         smooth_kernel = make_smooth_kernel(cfg["smooth_sigma_bins"], device)
         ds = make_raw_trace_dataset(repo, trace.path)
@@ -352,6 +397,8 @@ def worker_main(rank: int, args_dict: dict[str, Any], traces_payload: list[dict[
                 elevation_indices=cfg["elevation_indices"],
                 merge=cfg["merge"],
                 smooth_kernel=smooth_kernel,
+                smooth_mode=cfg["smooth_mode"],
+                output_scale=cfg["output_scale"],
             )
             pending.append(arr)
             pending_count += arr.shape[0]
@@ -445,6 +492,16 @@ def main() -> None:
     out_root.mkdir(parents=True, exist_ok=True)
 
     cfg = load_precompute_config(repo, args.configs)
+    if args.traces:
+        selected = set(args.traces)
+        configured = set(cfg["traces"])
+        missing = selected - configured
+        if missing:
+            raise ValueError(f"Unknown traces requested: {sorted(missing)}")
+        cfg = {
+            **cfg,
+            "traces": [name for name in cfg["traces"] if name in selected],
+        }
     fingerprint = preprocess_fingerprint(
         cfg, args.cache_dtype, args.limit_per_trace)
     traces = discover_traces(repo, data_root, cfg)

@@ -1,0 +1,31 @@
+# Honest single-elevation control: preserve the native I/Q-1M Doppler index grid.
+# This does not claim physical alignment to RADs [-90,90); it isolates elevation
+# pruning and the GRT architecture from Doppler remapping artifacts.
+dataset:
+  channels:
+    radar:
+      args:
+        :transform:
+        - name: AssertTx2
+          args: {}
+        - name: IIQQtoIQ
+          args:
+            scale: 0.001
+        - name: FFTArray
+          args:
+            pad: 0
+            axes: [0, 1, 2, 3]
+        - name: RADsLikeDoppler
+          args:
+            target_bins: 64
+            target_max_speed: 90.0
+            elevation_index: 0
+            mapping: native_index
+            merge: mean
+            smooth_sigma_bins: 0.0
+        - name: ComplexPhase
+          args: {}
+
+encoder:
+  args:
+    :patch: [2, 8, 1, 4]

@@ -3,7 +3,8 @@ dataset:
   # model-selection protocol while retaining 90% for adaptation.
   ptrain: 0.9
   pval: 0.1
-  batch_size: 16
+  # Matches the validated A256 step-9000 run on the single RTX 5090.
+  batch_size: 32
   val_samples: 16
   # Deterministic samples spread across the complete concatenated val pool.
   val_subsample: 2048

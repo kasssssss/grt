@@ -20,6 +20,8 @@ resolution or equal sensor statistics.
 `scripts/rads_map_checkpoint_infer.py` can reduce RADs `A=256` to I/Q-1M's
 native `A=8`. The supported reducers are:
 
+- `aperture_truncate`
+- `aperture_window`
 - `gaussian_coherent`
 - `sector_coherent`
 - `sector_energy_circular`
@@ -29,6 +31,20 @@ On three fixed RADs frames, sector-coherent reduction preserved the RA energy
 layout best, while sector-max-energy gave the best sparse-GT F1/recall at
 `logit > 0`. Absolute F1 is not directly comparable to I/Q-1M LiDAR occupancy
 because `RADs_gt` is sparse radar occupancy.
+
+`aperture_truncate` is the only reducer algebraically matched to the A256
+training representation. It applies inverse azimuth FFT, keeps the first eight
+aperture coefficients, and transforms those coefficients back to A8. For an
+A256 tensor produced by the I/Q-1M zero-padded-aperture path, this is an exact
+inverse up to floating-point error. The sector reducers remain useful empirical
+baselines for pseudo-angular RADs data, but they do not invert the training
+transform.
+
+The RADs audit found a boundary-straddling effective aperture. A window learned
+from sequence 100 selected circular indices `[253,254,255,0,1,2,3,4]`, rather
+than `[0..7]`. Use `aperture_window --aperture-start -3` for this globally
+calibrated contract. Do not search the window independently for each evaluation
+frame; calibration and evaluation sequences must remain disjoint.
 
 ## A256 Model Path
 
@@ -176,3 +192,72 @@ Do not fine-tune the full model merely to adapt this branch. One full
 3,000-step unpatch-only run also failed (`map_f1=0.28013`, depth MAE `6.761`).
 Both checkpoints are rejected. Retain the original step-9000 checkpoint and
 use the shifted branch only as the documented optional ablation.
+
+## Doppler Contract Audit
+
+I/Q-1M's 64 Doppler bins cover only about `[-1.22, 1.18] m/s`, while the
+RADs-like target grid is the half-open interval `[-90, 90) m/s` with
+`2.8125 m/s/bin`. The legacy transform maps all I/Q-1M bins to the center,
+computes a complex mean, and applies a Gaussian. This can cancel opposite
+phases and copies one phase estimate into unobserved velocities.
+
+Three explicit variants are now separated:
+
+- `rads_like.yaml`: legacy checkpoint-compatible mean plus complex Gaussian;
+- `rads_like_native_doppler.yaml`: native index grid, single elevation, no blur;
+- `rads_like_power_doppler.yaml`: physical mapping with RMS magnitude and
+  strongest-bin phase, leaving unobserved target bins at zero;
+- `rads_like_power_blur_doppler.yaml`: the same non-cancelling merge followed
+  by power-preserving Gaussian blur and a documented sensor-scale calibration.
+
+On the same 76 I/Q-1M frames with `best-primary-017-9000.ckpt`, the unmodified
+legacy input scored `map_f1=0.27797`. Raw native and raw RMS inputs are strongly
+out of distribution (`0.01937` and `0.09729`). Power-preserving blur plus a
+stored-magnitude scale of `0.35` recovered `map_f1=0.27458` without training.
+A scale of `0.25` achieved Chamfer `2.25157`, better than legacy `2.36450`, at
+`map_f1=0.26605`. This is smoke-set calibration, not final model selection;
+confirm it on a sequence-disjoint larger cache before full preprocessing.
+
+The follow-up check used 256 later frames from each of `outdoor/baum` and
+`outdoor/cmu.east`, excluding the first 256 frames. Legacy input scored
+`map_f1=0.27951`; the power-preserving scale-0.35 input scored `0.28142`.
+Depth and Chamfer remained worse (`11.21` and `3.21` versus `10.22` and
+`2.89`), so this transform is a validated training candidate rather than a
+drop-in improvement for every metric of the legacy checkpoint. A narrower
+`sigma=0.4` kernel matched RADs' three-bin Doppler support but reduced the old
+checkpoint's 76-frame F1 to about `0.236`; retain it only as a from-scratch
+ablation.
+
+## Cross-Domain Input Audit
+
+`scripts/audit_rads_iq1m_input_distribution.py` compares model-input power
+profiles and phase statistics on matched A8 tensors. On 512 held-out I/Q-1M
+frames and 32 evenly sampled RADs frames:
+
+- azimuth was the closest axis (`JS=0.082` for power-preserving I/Q-1M versus
+  cropped RADs), supporting the matched aperture projection;
+- Doppler still differed (`JS=0.230`): RADs had about three active bins while
+  the checkpoint-compatible I/Q-1M transform had eleven;
+- range differed most structurally (`JS=0.273`): after valid near-range
+  cropping, RADs power had median/95th-percentile bins `5/18`, versus `39/249`
+  for I/Q-1M;
+- the A256 RADs tensor lost about `61.5%` relative L2 energy after fixed
+  A8 projection and re-expansion.
+
+The last result does not by itself justify a VAE. A sequence-disjoint complex
+PCA rank-8 basis retained more than 99% of RADs energy, so the bottleneck is not
+rank alone; it is preserving the A8 coordinate semantics expected by the GRT
+checkpoint. A stochastic VAE would add phase noise and encourage smoothing.
+If a learned adapter is needed, use a deterministic complex A256-to-A8
+projection initialized from `aperture_truncate`, train it jointly with an A8
+reconstruction decoder, and constrain its I/Q-1M output to the physical A8
+target while optimizing the downstream occupancy/depth objective. This makes
+the adapter testable against the fixed projection instead of hiding a changed
+coordinate system inside an unconstrained latent code.
+
+For the next controlled adaptation, retain the validated optimizer and batch
+contract from `map_a256_dim_align_b32_20260711`: batch size 32, no gradient
+accumulation, AdamW at `1e-4`, `ptrain/pval=0.9/0.1`, and 2,048 deterministic
+validation samples. Validate every 2,000 optimizer steps. Changing the input
+transform and effective batch size simultaneously would make the ablation
+uninterpretable.

@@ -56,7 +56,8 @@ class RADsLikeDoppler(Transform):
         self, path: str, target_bins: int = 64,
         target_max_speed: float = 90.0, elevation_index: Optional[int] = None,
         elevation_indices: Optional[list[int]] = None, merge: str = "mean",
-        smooth_sigma_bins: float = 0.0
+        smooth_sigma_bins: float = 0.0, mapping: str = "physical",
+        smooth_mode: str = "complex", output_scale: float = 1.0
     ) -> None:
         with open(os.path.join(path, "radar", "radar.json")) as f:
             cfg = json.load(f)
@@ -65,10 +66,16 @@ class RADsLikeDoppler(Transform):
             raise ValueError("target_bins must be positive.")
         if target_max_speed <= 0:
             raise ValueError("target_max_speed must be positive.")
-        if merge not in {"mean", "sum"}:
-            raise ValueError("merge must be 'mean' or 'sum'.")
+        if merge not in {"mean", "sum", "rms_peak_phase"}:
+            raise ValueError("merge must be 'mean', 'sum', or 'rms_peak_phase'.")
+        if mapping not in {"physical", "native_index"}:
+            raise ValueError("mapping must be 'physical' or 'native_index'.")
         if smooth_sigma_bins < 0:
             raise ValueError("smooth_sigma_bins must be non-negative.")
+        if smooth_mode not in {"complex", "power_peak_phase"}:
+            raise ValueError("smooth_mode must be 'complex' or 'power_peak_phase'.")
+        if output_scale <= 0:
+            raise ValueError("output_scale must be positive.")
 
         self.source_doppler_res = float(cfg["doppler_resolution"])
         self.target_bins = int(target_bins)
@@ -82,7 +89,10 @@ class RADsLikeDoppler(Transform):
         else:
             self.elevation_indices = None
         self.merge = merge
+        self.mapping = mapping
         self.smooth_sigma_bins = float(smooth_sigma_bins)
+        self.smooth_mode = smooth_mode
+        self.output_scale = float(output_scale)
 
     def __call__(
         self, data: Complex64[np.ndarray, "T D A E R"],
@@ -109,23 +119,42 @@ class RADsLikeDoppler(Transform):
             dtype=data.dtype)
         counts = np.zeros(self.target_bins, dtype=np.int32)
 
-        source_velocity = (
-            np.arange(source_bins, dtype=np.float32) - source_bins // 2
-        ) * self.source_doppler_res
-        target_res = 2.0 * self.target_max_speed / self.target_bins
-        target_index = np.rint(
-            source_velocity / target_res + self.target_bins // 2
-        ).astype(np.int32)
+        if self.mapping == "native_index":
+            if self.target_bins != source_bins:
+                raise ValueError(
+                    "native_index mapping requires target_bins == source_bins, "
+                    f"got {self.target_bins} and {source_bins}.")
+            target_index = np.arange(source_bins, dtype=np.int32)
+        else:
+            source_velocity = (
+                np.arange(source_bins, dtype=np.float32) - source_bins // 2
+            ) * self.source_doppler_res
+            target_res = 2.0 * self.target_max_speed / self.target_bins
+            target_index = np.rint(
+                source_velocity / target_res + self.target_bins // 2
+            ).astype(np.int32)
 
         kept = data[:, :, :, list(elevation_indices), :]
-        for source_idx, target_idx in enumerate(target_index):
+        for target_idx in target_index:
             if 0 <= target_idx < self.target_bins:
-                target[:, target_idx] += kept[:, source_idx]
                 counts[target_idx] += 1
 
-        if self.merge == "mean":
-            nonzero = counts > 0
-            target[:, nonzero] /= counts[nonzero][None, :, None, None, None]
+        if self.merge == "rms_peak_phase":
+            for target_idx in np.flatnonzero(counts):
+                source = np.flatnonzero(target_index == target_idx)
+                group = kept[:, source]
+                amplitude = np.sqrt(np.mean(np.square(np.abs(group)), axis=1))
+                peak_index = np.argmax(np.abs(group), axis=1)
+                peak = np.take_along_axis(
+                    group, peak_index[:, None, ...], axis=1)[:, 0]
+                target[:, target_idx] = amplitude * np.exp(1j * np.angle(peak))
+        else:
+            for source_idx, target_idx in enumerate(target_index):
+                if 0 <= target_idx < self.target_bins:
+                    target[:, target_idx] += kept[:, source_idx]
+            if self.merge == "mean":
+                nonzero = counts > 0
+                target[:, nonzero] /= counts[nonzero][None, :, None, None, None]
 
         if self.smooth_sigma_bins > 0:
             radius = max(1, int(np.ceil(3.0 * self.smooth_sigma_bins)))
@@ -137,12 +166,27 @@ class RADsLikeDoppler(Transform):
                 target,
                 ((0, 0), (radius, radius), (0, 0), (0, 0), (0, 0)),
                 mode="constant")
-            smoothed = np.zeros_like(target)
-            for i, weight in enumerate(kernel):
-                smoothed += weight * padded[:, i:i + self.target_bins]
-            target = smoothed
+            if self.smooth_mode == "complex":
+                smoothed = np.zeros_like(target)
+                for i, weight in enumerate(kernel):
+                    smoothed += weight * padded[:, i:i + self.target_bins]
+                target = smoothed
+            else:
+                smoothed_power = np.zeros(target.shape, dtype=np.float32)
+                best_score = np.zeros(target.shape, dtype=np.float32)
+                best_source = np.zeros_like(target)
+                for i, weight in enumerate(kernel):
+                    source = padded[:, i:i + self.target_bins]
+                    score = weight * np.square(np.abs(source))
+                    smoothed_power += score
+                    update = score > best_score
+                    best_score = np.where(update, score, best_score)
+                    best_source = np.where(update, source, best_source)
+                target = np.sqrt(smoothed_power) * np.exp(1j * np.angle(best_source))
 
-        return target
+        target *= self.output_scale
+
+        return target.astype(data.dtype, copy=False)
 
 
 class Representation(Transform):

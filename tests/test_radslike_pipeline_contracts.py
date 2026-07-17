@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+import numpy as np
 import pytest
 
 from deepradar.channels import PrecomputedRadarChannel
@@ -183,3 +184,44 @@ def test_inference_paths_and_elevation_choice_are_explicit() -> None:
     assert "elevation_index: 0" in config
     assert "negative/downward elevation bin" in config
     assert "does not mean zero elevation" in config
+
+
+def test_aperture_truncate_is_exact_for_iq1m_a256_subspace() -> None:
+    infer = load_script("rads_map_checkpoint_infer.py")
+    rng = np.random.default_rng(17)
+    native = (
+        rng.standard_normal((3, 8, 5))
+        + 1j * rng.standard_normal((3, 8, 5))
+    ).astype(np.complex64)
+    aperture = np.fft.ifft(np.fft.ifftshift(native, axes=1), axis=1)
+    padded = np.pad(aperture, ((0, 0), (0, 248), (0, 0)))
+    expanded = np.fft.fftshift(np.fft.fft(padded, axis=1), axes=1)
+
+    recovered = infer.reduce_azimuth(
+        expanded, target_bins=8, mode="aperture_truncate", beam_sigma=18.0)
+
+    np.testing.assert_allclose(recovered, native, rtol=2e-6, atol=2e-6)
+
+
+def test_circular_aperture_window_recovers_boundary_straddling_array() -> None:
+    infer = load_script("rads_map_checkpoint_infer.py")
+    rng = np.random.default_rng(23)
+    aperture8 = (
+        rng.standard_normal((3, 8, 5))
+        + 1j * rng.standard_normal((3, 8, 5))
+    ).astype(np.complex64)
+    aperture256 = np.zeros((3, 256, 5), dtype=np.complex64)
+    indices = (-3 + np.arange(8)) % 256
+    aperture256[:, indices, :] = aperture8
+    expanded = np.fft.fftshift(np.fft.fft(aperture256, axis=1), axes=1)
+    expected = np.fft.fftshift(np.fft.fft(aperture8, axis=1), axes=1)
+
+    recovered = infer.reduce_azimuth(
+        expanded,
+        target_bins=8,
+        mode="aperture_window",
+        beam_sigma=18.0,
+        aperture_start=-3,
+    )
+
+    np.testing.assert_allclose(recovered, expected, rtol=2e-6, atol=2e-6)

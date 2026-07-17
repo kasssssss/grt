@@ -1,0 +1,36 @@
+# Checkpoint-compatible, power-preserving RADs-like Doppler ablation.
+# RMS/peak-phase merge avoids coherent cancellation. Gaussian weights spread
+# power, not complex amplitude, and therefore preserve total power before the
+# global sensor-scale calibration. output_scale=0.1225 corresponds to a 0.35
+# scale in the stored sqrt-magnitude channel. It was selected on a 76-frame
+# smoke set and retained legacy-level F1 on a disjoint 512-frame check.
+dataset:
+  channels:
+    radar:
+      args:
+        :transform:
+        - name: AssertTx2
+          args: {}
+        - name: IIQQtoIQ
+          args:
+            scale: 0.001
+        - name: FFTArray
+          args:
+            pad: 0
+            axes: [0, 1, 2, 3]
+        - name: RADsLikeDoppler
+          args:
+            target_bins: 64
+            target_max_speed: 90.0
+            elevation_index: 0
+            mapping: physical
+            merge: rms_peak_phase
+            smooth_sigma_bins: 1.25
+            smooth_mode: power_peak_phase
+            output_scale: 0.1225
+        - name: ComplexPhase
+          args: {}
+
+encoder:
+  args:
+    :patch: [2, 8, 1, 4]
