@@ -9,6 +9,7 @@ from deepradar.objectives.occupancy3 import PolarOccupancy
 from deepradar.objectives.semantics import Segmentation
 from deepradar.pretrained import _resolve_decoder_head
 from deepradar.transforms.radar import PrecomputedComplexPhaseAugment
+from scripts.rads_map_checkpoint_infer import first_hit_depth
 from train import (
     _FrozenModulesEvalCallback,
     _SelectiveTrainModeCallback,
@@ -178,6 +179,31 @@ def test_first_hit_has_explicit_invalid_zero():
     depth, valid = PolarOccupancy._first_hit(occupancy)
     assert depth.tolist() == [[[0.0, 1.0]]]
     assert valid.tolist() == [[[False, True]]]
+
+
+def test_soft_first_hit_matches_single_confident_surface():
+    logits = torch.full((1, 1, 2, 4), -20.0)
+    logits[0, 0, 0, 2] = 20.0
+    depth, hit_mass = PolarOccupancy._soft_first_hit(
+        logits, threshold=1.0, temperature=0.25)
+    torch.testing.assert_close(depth[0, 0, 0], torch.tensor(3.0))
+    torch.testing.assert_close(hit_mass[0, 0, 0], torch.tensor(1.0))
+    assert hit_mass[0, 0, 1] < 1e-5
+
+
+def test_soft_first_hit_rejects_nonpositive_temperature():
+    logits = torch.zeros((1, 1, 1, 2))
+    with pytest.raises(ValueError):
+        PolarOccupancy._soft_first_hit(logits, temperature=0.0)
+
+
+def test_rads_first_hit_uses_training_one_based_range_contract():
+    logits = np.full((1, 2, 4), -10.0, dtype=np.float32)
+    logits[0, 0, 2] = 10.0
+    depth, valid_fraction = first_hit_depth(logits, threshold=0.0)
+    assert depth[0, 0] == 3.0
+    assert np.isnan(depth[0, 1])
+    assert valid_fraction == 0.5
 
 
 def test_decoder_head_is_inferred_or_validated():

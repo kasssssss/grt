@@ -483,9 +483,31 @@ def prepare_modes(
 def first_hit_depth(logits: np.ndarray, threshold: float) -> tuple[np.ndarray, float]:
     occ = logits > threshold
     has = occ.any(axis=-1)
-    depth = np.argmax(occ.astype(np.uint8), axis=-1).astype(np.float32)
+    depth = np.argmax(occ.astype(np.uint8), axis=-1).astype(np.float32) + 1.0
     depth[~has] = np.nan
     return depth, float(has.mean())
+
+
+def soft_first_hit_depth(
+    logits: np.ndarray,
+    threshold: float = 1.0,
+    temperature: float = 0.25,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute conditional expected first-hit depth and per-ray hit mass."""
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    tensor = torch.from_numpy(logits)
+    probability = torch.sigmoid((tensor - threshold) / temperature)
+    probability = probability.clamp(1e-7, 1.0 - 1e-7)
+    leading_survival = torch.cumprod(1.0 - probability[..., :-1], dim=-1)
+    survival = torch.cat(
+        (torch.ones_like(probability[..., :1]), leading_survival), dim=-1)
+    hit = survival * probability
+    hit_mass = torch.sum(hit, dim=-1)
+    bins = torch.arange(
+        1, tensor.shape[-1] + 1, dtype=tensor.dtype, device=tensor.device)
+    depth = torch.sum(hit * bins, dim=-1) / hit_mass.clamp_min(1e-7)
+    return depth.numpy(), hit_mass.numpy()
 
 
 def binary_metrics(pred: np.ndarray, target: np.ndarray) -> dict[str, float]:
@@ -556,6 +578,10 @@ def infer_one(
         bev = (logits > threshold).max(axis=0).astype(np.float32)
         pred[f"bev_polar_logit_gt_{threshold:g}"] = bev
         pred[f"bev_cart_logit_gt_{threshold:g}"] = polar_to_cartesian(bev)
+    depth_soft, hit_mass_soft = soft_first_hit_depth(
+        logits, threshold=1.0, temperature=0.25)
+    pred["depth_soft_t1_temp025"] = depth_soft
+    pred["hit_mass_soft_t1_temp025"] = hit_mass_soft
     pred["bev_polar_prob_maxe"] = prob.max(axis=0)
     pred["bev_cart_prob_maxe"] = polar_to_cartesian(pred["bev_polar_prob_maxe"])
     return pred
@@ -619,6 +645,8 @@ def summarize_frame(
             "invalid_frac_logit_gt_0": 1.0 - pred["valid_frac_logit_gt_0"],
             "valid_frac_logit_gt_1": pred["valid_frac_logit_gt_1"],
             "invalid_frac_logit_gt_1": 1.0 - pred["valid_frac_logit_gt_1"],
+            "soft_hit_mass_mean_t1_temp025": float(
+                np.mean(pred["hit_mass_soft_t1_temp025"])),
         }
         if prep.gt_polar is not None:
             stats["rads_gt_note"] = (
@@ -1022,6 +1050,8 @@ def main() -> int:
                     invalid_mask_logit_gt_m1=pred["invalid_mask_logit_gt_-1"].astype(np.uint8),
                     invalid_mask_logit_gt_0=pred["invalid_mask_logit_gt_0"].astype(np.uint8),
                     invalid_mask_logit_gt_1=pred["invalid_mask_logit_gt_1"].astype(np.uint8),
+                    depth_soft_t1_temp025=pred["depth_soft_t1_temp025"].astype(np.float16),
+                    hit_mass_soft_t1_temp025=pred["hit_mass_soft_t1_temp025"].astype(np.float16),
                     input_azimuth_bins=np.asarray(prep.azimuth_bins, dtype=np.int16),
                     gt_polar=(
                         prep.gt_polar.astype(np.uint8)

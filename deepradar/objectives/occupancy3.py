@@ -95,6 +95,8 @@ class PolarOccupancy(Objective):
         seam_weight: float = 0.0,
         seam_patch: Sequence[int] = (8, 8, 8),
         seam_context_radius: int = 2,
+        soft_depth_threshold: float = 1.0,
+        soft_depth_temperature: float = 0.25,
     ) -> None:
         self.weight = weight
         self.range_weighted = range_weighted
@@ -105,10 +107,14 @@ class PolarOccupancy(Objective):
         self.seam_weight = float(seam_weight)
         self.seam_patch = tuple(int(value) for value in seam_patch)
         self.seam_context_radius = int(seam_context_radius)
+        self.soft_depth_threshold = float(soft_depth_threshold)
+        self.soft_depth_temperature = float(soft_depth_temperature)
         if len(self.seam_patch) != 3 or any(value < 1 for value in self.seam_patch):
             raise ValueError("seam_patch must contain three positive values.")
         if self.seam_context_radius < 0:
             raise ValueError("seam_context_radius must be non-negative.")
+        if self.soft_depth_temperature <= 0:
+            raise ValueError("soft_depth_temperature must be positive.")
 
         self.chamfer = PolarChamfer(
             az_span=az_span, el_span=el_span, max_range=max_range)
@@ -122,6 +128,39 @@ class PolarOccupancy(Objective):
         depth = torch.argmax(
             occupancy.to(torch.uint8), dim=-1).to(torch.float32) + 1.0
         return torch.where(valid, depth, 0.0), valid
+
+    @staticmethod
+    def _soft_first_hit(
+        logits: Float[Tensor, "batch el az rng"],
+        threshold: float = 1.0,
+        temperature: float = 0.25,
+    ) -> tuple[
+        Float[Tensor, "batch el az"],
+        Float[Tensor, "batch el az"],
+    ]:
+        """Return conditional expected first-hit depth and hit probability.
+
+        Occupancy logits are interpreted as independent Bernoulli hazards
+        along each range ray. The hit weights are transmittance times hazard,
+        matching discrete volume rendering while avoiding hard-threshold jumps.
+        """
+        if temperature <= 0:
+            raise ValueError("temperature must be positive.")
+        probability = torch.sigmoid((logits - threshold) / temperature)
+        probability = probability.clamp(1e-7, 1.0 - 1e-7)
+        leading_survival = torch.cumprod(
+            1.0 - probability[..., :-1], dim=-1)
+        survival = torch.cat(
+            (torch.ones_like(probability[..., :1]), leading_survival), dim=-1)
+        hit = survival * probability
+        hit_mass = torch.sum(hit, dim=-1)
+        bins = torch.arange(
+            1, logits.shape[-1] + 1,
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        depth = torch.sum(hit * bins, dim=-1) / hit_mass.clamp_min(1e-7)
+        return depth, hit_mass
 
     def bce_loss(
         self, y_true: Bool[Tensor, "batch el az rng"],
@@ -224,6 +263,16 @@ class PolarOccupancy(Objective):
                 "map_loss": bce,
                 "map_seam": seam,
             }
+            depth_soft, hit_mass_soft = self._soft_first_hit(
+                y_hat["map"],
+                threshold=self.soft_depth_threshold,
+                temperature=self.soft_depth_temperature,
+            )
+            metrics["map_depth_soft"] = LPObjective(
+                ord=1, mask=0)(depth_soft, depth_true, reduce=reduce)
+            soft_confidence = torch.mean(hit_mass_soft, dim=(1, 2))
+            metrics["map_hit_mass_soft"] = (
+                torch.mean(soft_confidence) if reduce else soft_confidence)
             for label, threshold in (("m1", -1.0), ("0", 0.0), ("p1", 1.0)):
                 y_hat_occ = y_hat["map"] > threshold
                 depth_hat, valid_hat = self._first_hit(y_hat_occ)
@@ -256,6 +305,11 @@ class PolarOccupancy(Objective):
 
         map_pred = y_hat['map'] > 0
         depth_hat, _ = self._first_hit(map_pred)
+        depth_soft, hit_mass_soft = self._soft_first_hit(
+            y_hat['map'],
+            threshold=self.soft_depth_threshold,
+            temperature=self.soft_depth_temperature,
+        )
         bev_hat = polar3_to_bev(map_pred, mode="highest")
         bev_hat[bev_hat == 0] = torch.min(bev_hat) - 2
 
@@ -266,7 +320,18 @@ class PolarOccupancy(Objective):
                 depth / y_true['map'].shape[-1],
                 depth_hat / y_true['map'].shape[-1],
                 cmap=self.cmap_depth, cols=8, normalize=False,
-                invalid_zero_black=True)}
+                invalid_zero_black=True),
+            "depth_soft": comparison_grid(
+                depth / y_true['map'].shape[-1],
+                depth_soft / y_true['map'].shape[-1],
+                cmap=self.cmap_depth, cols=8, normalize=False,
+                invalid_zero_black=True),
+            "depth_soft_confidence": comparison_grid(
+                (depth > 0).to(hit_mass_soft.dtype),
+                hit_mass_soft,
+                cmap="gray", cols=8, normalize=False,
+                invalid_zero_black=True),
+        }
 
     RENDER_CHANNELS: dict[str, dict[str, Any]] = {
         "bev": {
@@ -275,6 +340,12 @@ class PolarOccupancy(Objective):
         "depth": {
             "format": "lzma", "type": "u1", "shape": [64, 128],
             "desc": "elevation-azimuth depth image from 3D polar occupancy."},
+        "depth_soft": {
+            "format": "lzma", "type": "u1", "shape": [64, 128],
+            "desc": "probabilistic first-hit depth from 3D polar occupancy."},
+        "depth_soft_confidence": {
+            "format": "lzma", "type": "u1", "shape": [64, 128],
+            "desc": "probability that each ray contains an occupancy hit."},
         "bev_gt": {
             "format": "lzma", "type": "u1", "shape": [64, 128],
             "desc": "ground-truth BEV from lidar"},
@@ -303,9 +374,16 @@ class PolarOccupancy(Objective):
             data, and the value is a quantized or packed format if possible.
         """
         map_pred = y_hat['map'] > 0
+        depth_soft, hit_mass_soft = self._soft_first_hit(
+            y_hat['map'],
+            threshold=self.soft_depth_threshold,
+            temperature=self.soft_depth_temperature,
+        )
         raw = {
             "bev": 255 - polar3_to_bev(map_pred, mode="highest"),
-            "depth": self._first_hit(map_pred)[0]
+            "depth": self._first_hit(map_pred)[0],
+            "depth_soft": depth_soft,
+            "depth_soft_confidence": 255.0 * hit_mass_soft,
         }
 
         if gt:

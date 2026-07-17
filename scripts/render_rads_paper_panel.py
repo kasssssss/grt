@@ -101,6 +101,16 @@ def render_frame(
         invalid_m1 = pred["invalid_mask_logit_gt_m1"].astype(bool)
         invalid_0 = pred["invalid_mask_logit_gt_0"].astype(bool)
         invalid_1 = pred["invalid_mask_logit_gt_1"].astype(bool)
+        depth_soft = (
+            pred["depth_soft_t1_temp025"].astype(np.float32)
+            if "depth_soft_t1_temp025" in pred.files
+            else depth_0
+        )
+        hit_mass_soft = (
+            pred["hit_mass_soft_t1_temp025"].astype(np.float32)
+            if "hit_mass_soft_t1_temp025" in pred.files
+            else (~invalid_0).astype(np.float32)
+        )
 
     shifted = shift_range_cube(cube, crop_start)
     _, raw_views, input_views, _ = build_sample(
@@ -121,7 +131,7 @@ def render_frame(
         doppler_keep_bins=11,
     )
 
-    fig, axes = plt.subplots(2, 3, figsize=(20, 9), constrained_layout=True)
+    fig, axes = plt.subplots(2, 4, figsize=(24, 9), constrained_layout=True)
     show_magnitude(axes[0, 0], raw_views["ra"], "Cropped raw RA")
     set_axes(axes[0, 0], "range bin", "azimuth bin")
     show_magnitude(axes[0, 1], raw_views["rd"], "Cropped raw RD")
@@ -129,7 +139,7 @@ def render_frame(
     show_magnitude(axes[0, 2], input_views["ra"], "Model input RA (A8)")
     set_axes(axes[0, 2], "range bin", "physical aperture beam")
 
-    axes[1, 0].imshow(
+    axes[0, 3].imshow(
         gt_polar.astype(np.float32),
         cmap="gray",
         origin="upper",
@@ -138,27 +148,49 @@ def render_frame(
         vmax=1.0,
         interpolation="nearest",
     )
-    axes[1, 0].set_facecolor("black")
-    axes[1, 0].set_title("Sparse RADs_gt occupancy (index space)")
-    set_axes(axes[1, 0], "range cell", "azimuth cell")
+    axes[0, 3].set_facecolor("black")
+    axes[0, 3].set_title("Sparse RADs_gt occupancy (index space)")
+    set_axes(axes[0, 3], "range cell", "azimuth cell")
 
-    show_probability(axes[1, 1], bev_prob, "GRT BEV probability + RADs_gt")
+    show_probability(axes[1, 0], bev_prob, "GRT BEV probability + RADs_gt")
     yy, xx = np.nonzero(gt_polar)
-    axes[1, 1].scatter(
+    axes[1, 0].scatter(
         xx, yy, s=12, facecolors="none", edgecolors="#00ffff", linewidths=0.8,
         label="RADs_gt",
     )
-    axes[1, 1].legend(loc="upper right", framealpha=0.85)
-    set_axes(axes[1, 1], "range cell", "azimuth cell")
+    axes[1, 0].legend(loc="upper right", framealpha=0.85)
+    set_axes(axes[1, 0], "range cell", "azimuth cell")
 
-    valid_fraction = 1.0 - float(invalid_m1.mean())
+    valid_fraction = 1.0 - float(invalid_0.mean())
+    show_depth(
+        axes[1, 1],
+        depth_0,
+        invalid_0,
+        f"Hard first-hit depth (logit>0, valid={valid_fraction:.3f})",
+    )
+    set_axes(axes[1, 1], "horizontal output cell", "vertical output cell")
+
     show_depth(
         axes[1, 2],
-        depth_m1,
-        invalid_m1,
-        f"GRT first-hit depth (logit>-1, valid={valid_fraction:.3f})",
+        depth_soft,
+        np.zeros_like(depth_soft, dtype=bool),
+        "Soft first-hit depth (threshold=1, temperature=0.25)",
     )
     set_axes(axes[1, 2], "horizontal output cell", "vertical output cell")
+
+    confidence_image = axes[1, 3].imshow(
+        hit_mass_soft,
+        cmap="gray",
+        origin="upper",
+        aspect="auto",
+        vmin=0.0,
+        vmax=1.0,
+        interpolation="nearest",
+    )
+    axes[1, 3].set_title(
+        f"Soft hit probability (mean={float(hit_mass_soft.mean()):.3f})")
+    set_axes(axes[1, 3], "horizontal output cell", "vertical output cell")
+    plt.colorbar(confidence_image, ax=axes[1, 3], fraction=0.035, pad=0.02)
 
     fig.suptitle(
         f"RADs transfer with GRT RADs-like I/Q-1M best | "
