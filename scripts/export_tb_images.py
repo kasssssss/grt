@@ -57,8 +57,13 @@ def main() -> None:
         "--tags", nargs="*",
         help="Restrict export to these exact image tags.")
     p.add_argument(
+        "--scale", type=int, default=1,
+        help="Integer nearest-neighbor scale for lossless inspection.")
+    p.add_argument(
         "--contact-name", default="latest_tensorboard_images_contact_sheet.png")
     args = p.parse_args()
+    if args.scale < 1:
+        raise ValueError("--scale must be at least 1")
 
     event_dir = Path(args.event_dir)
     out_dir = Path(args.out_dir)
@@ -89,6 +94,11 @@ def main() -> None:
         for ev in selected:
             img = Image.open(io.BytesIO(ev.encoded_image_string)).convert("RGB")
             img = annotate_comparison_rows(img)
+            if args.scale > 1:
+                img = img.resize(
+                    (img.width * args.scale, img.height * args.scale),
+                    Image.Resampling.NEAREST,
+                )
             out = out_dir / f"{slug(tag)}_step{ev.step}.png"
             img.save(out)
             exported.append((tag, ev.step, out.name, img.size))
