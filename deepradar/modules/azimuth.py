@@ -46,8 +46,12 @@ class ComplexAzimuthProjection(nn.Module):
         source_bins: int = 256,
         target_bins: int = 8,
         start: int = 4,
+        rank: int | None = None,
     ) -> None:
         super().__init__()
+        if rank is not None and not 1 <= rank <= min(source_bins, target_bins):
+            raise ValueError(
+                "rank must be in [1, min(source_bins, target_bins)].")
         initial = physical_azimuth_projection(
             source_bins=source_bins,
             target_bins=target_bins,
@@ -56,14 +60,33 @@ class ComplexAzimuthProjection(nn.Module):
         self.source_bins = int(source_bins)
         self.target_bins = int(target_bins)
         self.start = int(start)
+        self.rank = rank
         self.register_buffer("initial", initial)
         self.scale = float(initial.abs().mean())
-        self.delta_real = nn.Parameter(torch.zeros_like(initial.real))
-        self.delta_imag = nn.Parameter(torch.zeros_like(initial.real))
+        if rank is None:
+            self.delta_real = nn.Parameter(torch.zeros_like(initial.real))
+            self.delta_imag = nn.Parameter(torch.zeros_like(initial.real))
+        else:
+            left = torch.zeros(source_bins, rank, dtype=initial.real.dtype)
+            generator = torch.Generator().manual_seed(20260719)
+            right = torch.randn(
+                target_bins, rank, generator=generator, dtype=initial.real.dtype
+            )
+            right = torch.linalg.qr(right, mode="reduced").Q.T.contiguous()
+            self.left_real = nn.Parameter(left.clone())
+            self.left_imag = nn.Parameter(left.clone())
+            self.right_real = nn.Parameter(right)
+            self.right_imag = nn.Parameter(torch.zeros_like(right))
+
+    def _delta(self) -> Tensor:
+        if self.rank is None:
+            return torch.complex(self.delta_real, self.delta_imag)
+        left = torch.complex(self.left_real, self.left_imag)
+        right = torch.complex(self.right_real, self.right_imag)
+        return left @ right
 
     def matrix(self) -> Tensor:
-        delta = torch.complex(self.delta_real, self.delta_imag)
-        return self.initial + self.scale * delta
+        return self.initial + self.scale * self._delta()
 
     def forward(self, spectrum: Tensor, azimuth_dim: int = 1) -> Tensor:
         if not torch.is_complex(spectrum):
@@ -92,7 +115,7 @@ class ComplexAzimuthProjection(nn.Module):
 
     def regularization(self) -> tuple[Tensor, Tensor]:
         """Return residual magnitude and row-orthogonality penalties."""
-        delta = self.delta_real.square().mean() + self.delta_imag.square().mean()
+        delta = self._delta().abs().square().mean()
         rows = self.matrix().T
         rows = rows / rows.norm(dim=1, keepdim=True).clamp_min(1e-8)
         gram = rows @ rows.conj().T

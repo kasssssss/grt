@@ -419,6 +419,32 @@ reported strict/tolerance F1 improved in both directions. At `logit > 0`:
 - held-out sequence 100 improved tol-2/tol-4 F1 from
   `0.15169/0.27320` to `0.16150/0.29027`.
 
+### Low-rank adapter ablation
+
+The learned full residual contains 4,096 real parameters. Its singular-value
+spectrum is strongly concentrated: a complex rank-4 approximation retained
+93.9% of the learned residual energy for the sequence-100 run and 95.0% for
+the sequence-101 run. A directly trained rank-4 parameterization uses 2,112
+real parameters, starts from exactly the same physical projection, and keeps
+the GRT checkpoint frozen.
+
+Full held-out evaluation showed that rank 4 preserves most, but not all, of the
+full adapter's performance:
+
+| Train | Held out | Residual | Strict F1 | Tol-1 F1 | Tol-2 F1 | Tol-4 F1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 101 | full | 0.01796 | 0.11240 | 0.20090 | 0.34895 |
+| 100 | 101 | rank 4 | 0.01768 | 0.11119 | 0.19831 | 0.34651 |
+| 101 | 100 | full | 0.01418 | 0.09026 | 0.16369 | 0.30135 |
+| 101 | 100 | rank 4 | 0.01395 | 0.08961 | 0.16255 | 0.30222 |
+
+The rank-4 model remains better than the physical baseline in both directions,
+including at the shared `logit > 0` threshold, but is usually 0.7-1.6% below
+the full residual. Therefore the full residual remains the default and the
+rank-4 implementation is retained only as a reproducible compression and
+effective-rank ablation. Pass `--rank 4` to enable it; omitting `--rank` keeps
+the highest-performing full adapter.
+
 It does **not** demonstrate solved monocular-style depth on RADs. `RADs_gt` is
 sparse radar occupancy rather than dense LiDAR depth, and the adapter receives
 no direct depth supervision. The central invalid wedge in first-hit depth

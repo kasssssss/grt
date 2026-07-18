@@ -52,6 +52,22 @@ def test_complex_projection_validates_input_contract() -> None:
         projection(torch.randn(2, 16, 3))
     with pytest.raises(ValueError, match="Expected A=16"):
         projection(torch.randn(2, 8, 3, dtype=torch.complex64))
+    with pytest.raises(ValueError, match="rank must be"):
+        ComplexAzimuthProjection(16, 4, rank=5)
+
+
+def test_low_rank_projection_is_exact_then_receives_gradients() -> None:
+    projection = ComplexAzimuthProjection(16, 4, start=2, rank=2)
+    expected = physical_azimuth_projection(16, 4, start=2)
+    torch.testing.assert_close(projection.matrix(), expected, rtol=0.0, atol=0.0)
+
+    value = torch.randn(2, 16, 3, dtype=torch.complex64)
+    projection(value).abs().mean().backward()
+    assert projection.left_real.grad is not None
+    assert projection.left_imag.grad is not None
+    assert torch.isfinite(projection.left_real.grad).all()
+    assert torch.isfinite(projection.left_imag.grad).all()
+    assert projection.left_real.grad.abs().sum() > 0
 
 
 def test_load_frame_uses_matched_cube_and_gt_crop(monkeypatch, tmp_path) -> None:

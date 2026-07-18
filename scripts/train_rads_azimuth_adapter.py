@@ -190,6 +190,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--hparams", type=Path, required=True)
     parser.add_argument("--start", type=int, default=4)
+    parser.add_argument(
+        "--rank",
+        type=int,
+        help=(
+            "Optional complex residual rank. Omit for the full residual matrix; "
+            "rank 4 is the validated compression ablation."
+        ),
+    )
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--train-frames", type=int, default=128)
@@ -216,7 +224,8 @@ def main() -> None:
     for parameter in model.parameters():
         parameter.requires_grad_(False)
 
-    adapter = ComplexAzimuthProjection(256, 8, start=args.start).to(device)
+    adapter = ComplexAzimuthProjection(
+        256, 8, start=args.start, rank=args.rank).to(device)
     optimizer = torch.optim.AdamW(
         adapter.parameters(), lr=args.learning_rate, weight_decay=0.0)
     payload = json.loads(args.manifest.read_text())
@@ -317,14 +326,17 @@ def main() -> None:
             print(json.dumps(history[-1], indent=2), flush=True)
             if score > best_score:
                 best_score = score
+                adapter_config = {
+                    "source_bins": 256,
+                    "target_bins": 8,
+                    "start": args.start,
+                }
+                if args.rank is not None:
+                    adapter_config["rank"] = args.rank
                 torch.save({
                     "format_version": 1,
                     "adapter": adapter.state_dict(),
-                    "adapter_config": {
-                        "source_bins": 256,
-                        "target_bins": 8,
-                        "start": args.start,
-                    },
+                    "adapter_config": adapter_config,
                     "step": step,
                     "train_sequence": args.train_sequence,
                     "val_sequence": args.val_sequence,
