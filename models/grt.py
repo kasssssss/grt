@@ -283,6 +283,15 @@ class TransformerDecoder(L.LightningModule):
         ) / 8.0
         return shifted.reshape(n, -1, c)
 
+    def _refine_queries(
+        self,
+        query: Float[Tensor, "n q c"],
+        grid: Sequence[int],
+    ) -> Float[Tensor, "n q c"]:
+        """Optionally refine decoded queries before voxel unpatching."""
+        del grid
+        return query
+
     def forward(
         self, encoded: Float[Tensor, "n s c"]
     ) -> dict[str, Float[Tensor, "n h w ..."]]:
@@ -304,11 +313,18 @@ class TransformerDecoder(L.LightningModule):
 
         x = self.query(x)
         enc = encoded[:, :-1, :]
-        out = self.unpatch(self._decode_queries(x, enc))
+        decoded = self._refine_queries(
+            self._decode_queries(x, enc), self.query_grid)
+        out = self.unpatch(decoded)
         if self.shift_blend > 0.0:
             shifted_grid = tuple(size - 1 for size in self.query_grid)
             shifted = self.unpatch.forward_grid(
-                self._decode_queries(self._shift_queries(x), enc), shifted_grid)
+                self._refine_queries(
+                    self._decode_queries(self._shift_queries(x), enc),
+                    shifted_grid,
+                ),
+                shifted_grid,
+            )
             slices = tuple(
                 slice(patch // 2, patch // 2 + shifted_size)
                 for patch, shifted_size in zip(self.patch, shifted.shape[1:-1])
@@ -323,6 +339,76 @@ class TransformerDecoder(L.LightningModule):
             out = out[..., 0]
 
         return {self.key: out}
+
+
+class QueryGridResidualMixer(nn.Module):
+    """Mix neighboring decoder queries before independent voxel unpatching."""
+
+    def __init__(
+        self, features: int, hidden: int = 64, kernel: int = 3
+    ) -> None:
+        super().__init__()
+        if hidden < 1:
+            raise ValueError("hidden must be positive.")
+        if kernel < 1 or kernel % 2 == 0:
+            raise ValueError("kernel must be a positive odd integer.")
+        self.norm = nn.LayerNorm(features)
+        self.input = nn.Conv3d(features, hidden, kernel_size=1)
+        self.spatial = nn.Conv3d(
+            hidden,
+            hidden,
+            kernel_size=kernel,
+            padding=kernel // 2,
+            groups=hidden,
+        )
+        self.output = nn.Conv3d(hidden, features, kernel_size=1)
+        self.activation = nn.GELU()
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(
+        self,
+        query: Float[Tensor, "n q c"],
+        grid: Sequence[int],
+    ) -> Float[Tensor, "n q c"]:
+        if len(grid) != 3:
+            raise ValueError("QueryGridResidualMixer requires a 3D query grid.")
+        expected = int(np.prod(grid))
+        if query.shape[1] != expected:
+            raise ValueError(
+                f"Expected {expected} queries for grid {tuple(grid)}, "
+                f"got {query.shape[1]}.")
+        n, _, c = query.shape
+        shaped = query.reshape(n, *grid, c)
+        mixed = self.norm(shaped).movedim(-1, 1)
+        mixed = self.activation(self.input(mixed))
+        mixed = self.activation(self.spatial(mixed))
+        mixed = self.output(mixed).movedim(1, -1).reshape_as(query)
+        return query + mixed
+
+
+class QueryMixedTransformerDecoder(TransformerDecoder):
+    """GRT decoder with local, zero-initialized query-grid interaction."""
+
+    def __init__(
+        self, mixer_dim: int = 64, mixer_kernel: int = 3, **kwargs
+    ) -> None:
+        if len(kwargs.get("shape", (1024, 256))) != 3:
+            raise ValueError(
+                "QueryMixedTransformerDecoder requires a 3D output shape.")
+        super().__init__(**kwargs)
+        self.refiner = QueryGridResidualMixer(
+            features=self.unpatch.linear.in_features,
+            hidden=mixer_dim,
+            kernel=mixer_kernel,
+        )
+
+    def _refine_queries(
+        self,
+        query: Float[Tensor, "n q c"],
+        grid: Sequence[int],
+    ) -> Float[Tensor, "n q c"]:
+        return self.refiner(query, grid)
 
 
 class ResidualRefinedTransformerDecoder(TransformerDecoder):

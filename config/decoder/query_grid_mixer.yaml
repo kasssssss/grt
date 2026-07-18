@@ -1,0 +1,7 @@
+# Zero-initialized local interaction between neighboring decoder queries.
+# This acts before each query is independently expanded into an output patch.
+decoder:
+  name: QueryMixedTransformerDecoder
+  args:
+    mixer_dim: 64
+    mixer_kernel: 3

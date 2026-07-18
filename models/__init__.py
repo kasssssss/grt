@@ -11,6 +11,7 @@
 from .axial import AxialEncoder
 from .grt import (
     AzimuthFFTTransformerEncoder,
+    QueryMixedTransformerDecoder,
     ResidualRefinedTransformerDecoder,
     TransformerDecoder,
     TransformerEncoder,
@@ -32,7 +33,8 @@ from .unext import UNeXTBEVDecoder, UNeXTEncoder
 __all__ = [
     "AxialEncoder",
     "TransformerEncoder", "AzimuthFFTTransformerEncoder",
-    "TransformerDecoder", "ResidualRefinedTransformerDecoder", "VectorDecoder",
+    "TransformerDecoder", "QueryMixedTransformerDecoder",
+    "ResidualRefinedTransformerDecoder", "VectorDecoder",
     "TransformerFourierEncoder",
     "SwinDPT2DDecoder", "SwinTransformerEncoder",
     "UNetEncoder", "AzimuthFFTUNetEncoder", "UNetBEVDecoder",

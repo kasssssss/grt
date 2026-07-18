@@ -18,6 +18,7 @@
     https://arxiv.org/abs/1912.12180
 """
 
+from .azimuth import ComplexAzimuthProjection, physical_azimuth_projection
 from .conv import ConvDownsample, ConvNeXTBlock, ConvResidual, ConvSeparable
 from .dpt import Fusion2D, FusionDecoder
 from .patch import FFTLinear, Patch2D, Patch4D, PatchMerge, Unpatch
@@ -27,6 +28,7 @@ from .transformer import BasisChange, TransformerDecoder, TransformerLayer
 from .window import RelativePositionBias, WindowPartition
 
 __all__ = [
+    "ComplexAzimuthProjection", "physical_azimuth_projection",
     "ConvDownsample", "ConvNeXTBlock", "ConvResidual", "ConvSeparable",
     "Fusion2D", "FusionDecoder",
     "FFTLinear", "Patch2D", "Patch4D", "Unpatch", "PatchMerge",

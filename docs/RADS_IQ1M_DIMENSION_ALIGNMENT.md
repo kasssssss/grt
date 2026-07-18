@@ -356,3 +356,86 @@ accumulation, AdamW at `1e-4`, `ptrain/pval=0.9/0.1`, and 2,048 deterministic
 validation samples. Validate every 2,000 optimizer steps. Changing the input
 transform and effective batch size simultaneously would make the ablation
 uninterpretable.
+
+## Query-Grid Mixer
+
+The original occupancy decoder reconstructs each `8 x 8 x 8` output patch
+independently after cross-attention. `QueryMixedTransformerDecoder` adds a
+zero-initialized residual mixer over the 3D query grid before unpatching. It
+uses a pointwise projection, a depthwise `3 x 3 x 3` convolution, and a second
+pointwise projection. The last projection is initialized to zero, so loading a
+standard decoder checkpoint is functionally exact before fine-tuning.
+
+On the fixed RADs-like I/Q-1M validation contract, the retained query-mixer
+checkpoint reached:
+
+- `map_f1=0.30378`, versus `0.29325` for the previous retained model;
+- boundary F1 with a two-cell tolerance of `0.67939`;
+- Cartesian BEV F1 of `0.73045`.
+
+This is a source-domain improvement. It reduces visible patch discontinuities,
+but it does not by itself align RADs' pseudo-A256 azimuth statistics with the
+physical I/Q-1M A8 coordinate system.
+
+## Supervised Complex Azimuth Adapter
+
+`ComplexAzimuthProjection` is a deterministic complex `A256 -> A8` projection
+initialized exactly from a circular eight-element aperture window. It learns a
+complex residual matrix while the query-mixer GRT checkpoint remains frozen.
+The adapter is trained with sparse RADs radar occupancy using four terms:
+
+1. positive supervision on a two-cell dilation of sparse `RADs_gt` points;
+2. distillation to the physical projection outside those positives;
+3. a penalty on increases in global occupancy mass;
+4. residual-magnitude and row-orthogonality regularization.
+
+The range crop is still applied to the complete complex RAD cube before the
+projection, RA/RD/AD derivation, or GT mapping. The input amplitude contract is
+the retained fixed `gamma=0.45`, `scale=2.6245` transform. The successful run
+uses zero phase, matching the RADs-like model-selection contract.
+
+The adapter was tested in both sequence-disjoint directions and then replayed
+on every held-out frame. All metrics below use pooled sparse-GT precision and
+recall, with one global threshold selected for each tolerance:
+
+| Train | Held out | Frames | Strict F1 | Tol-1 F1 | Tol-2 F1 | Tol-4 F1 |
+|---|---:|---:|---:|---:|---:|---:|
+| physical baseline | 101 | 277 | 0.01648 | 0.10484 | 0.19081 | 0.33783 |
+| sequence 100 adapter | 101 | 277 | 0.01796 | 0.11240 | 0.20090 | 0.34895 |
+| physical baseline | 100 | 306 | 0.01272 | 0.08223 | 0.15169 | 0.29050 |
+| sequence 101 adapter | 100 | 306 | 0.01418 | 0.09026 | 0.16369 | 0.30135 |
+
+The strict F1 gain is about 9-11%, and the two-cell-tolerance gain is about
+5-8% in both directions. This is the first RADs transfer change retained after
+full sequence-disjoint validation. It demonstrates that the fixed physical
+window leaves recoverable task information in RADs' pseudo-A256 axis.
+
+This conclusion is not an artifact of choosing a separate optimal logit
+threshold for the adapter. At each shared threshold in `{-1, 0, 1}`, every
+reported strict/tolerance F1 improved in both directions. At `logit > 0`:
+
+- held-out sequence 101 improved tol-2/tol-4 F1 from
+  `0.19081/0.32468` to `0.19905/0.34104`;
+- held-out sequence 100 improved tol-2/tol-4 F1 from
+  `0.15169/0.27320` to `0.16150/0.29027`.
+
+It does **not** demonstrate solved monocular-style depth on RADs. `RADs_gt` is
+sparse radar occupancy rather than dense LiDAR depth, and the adapter receives
+no direct depth supervision. The central invalid wedge in first-hit depth
+remains visible. Dense, calibrated RADs occupancy/depth labels are required
+before reporting metric 3D reconstruction quality.
+
+Reproduce training and full held-out evaluation with:
+
+```bash
+python scripts/train_rads_azimuth_adapter.py \
+  --data-root <data-root> --manifest <manifest.json> \
+  --checkpoint <query-mixer.ckpt> --hparams <hparams.yaml> \
+  --train-sequence 100 --val-sequence 101 --out <adapter-run>
+
+python scripts/evaluate_rads_azimuth_adapter.py \
+  --data-root <data-root> --manifest <manifest.json> \
+  --checkpoint <query-mixer.ckpt> --hparams <hparams.yaml> \
+  --adapter <adapter-run>/best_adapter.pt --sequence 101 \
+  --out <adapter-run>/full_seq101.json
+```
