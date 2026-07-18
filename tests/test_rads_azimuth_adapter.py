@@ -6,8 +6,10 @@ import models
 from scripts import train_rads_azimuth_adapter as adapter_train
 from deepradar.modules import (
     ComplexAzimuthProjection,
+    RangeConditionedComplexAzimuthProjection,
     physical_azimuth_projection,
 )
+from scripts.evaluate_rads_azimuth_adapter import load_adapter
 from models.grt import (
     QueryGridResidualMixer,
     QueryMixedTransformerDecoder,
@@ -68,6 +70,80 @@ def test_low_rank_projection_is_exact_then_receives_gradients() -> None:
     assert torch.isfinite(projection.left_real.grad).all()
     assert torch.isfinite(projection.left_imag.grad).all()
     assert projection.left_real.grad.abs().sum() > 0
+
+
+def test_range_conditioned_projection_is_exact_then_receives_gradients() -> None:
+    base = ComplexAzimuthProjection(16, 4, start=2)
+    with torch.no_grad():
+        base.delta_real.normal_(std=0.05)
+        base.delta_imag.normal_(std=0.05)
+    projection = RangeConditionedComplexAzimuthProjection(
+        base, range_bins=7, bands=3, rank=2)
+    value = torch.randn(2, 16, 7, dtype=torch.complex64)
+
+    torch.testing.assert_close(
+        projection(value), base(value), rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        projection.range_gates.sum(dim=1),
+        torch.ones(7),
+        rtol=0.0,
+        atol=1e-7,
+    )
+
+    projection(value).abs().mean().backward()
+    assert projection.left_real.grad is not None
+    assert projection.left_imag.grad is not None
+    assert projection.left_real.grad.abs().sum() > 0
+    assert all(parameter.grad is None for parameter in base.parameters())
+
+
+def test_range_conditioned_projection_validates_contract() -> None:
+    base = ComplexAzimuthProjection(16, 4)
+    with pytest.raises(ValueError, match="range_bins"):
+        RangeConditionedComplexAzimuthProjection(base, range_bins=0)
+    with pytest.raises(ValueError, match="bands"):
+        RangeConditionedComplexAzimuthProjection(base, bands=1)
+    with pytest.raises(ValueError, match="rank"):
+        RangeConditionedComplexAzimuthProjection(base, rank=5)
+
+    projection = RangeConditionedComplexAzimuthProjection(
+        base, range_bins=7, bands=3, rank=2)
+    with pytest.raises(ValueError, match="complex tensor"):
+        projection(torch.randn(2, 16, 7))
+    with pytest.raises(ValueError, match="Expected A=16"):
+        projection(torch.randn(2, 8, 7, dtype=torch.complex64))
+    with pytest.raises(ValueError, match="Expected R=7"):
+        projection(torch.randn(2, 16, 5, dtype=torch.complex64))
+
+
+def test_load_portable_range_conditioned_checkpoint(tmp_path) -> None:
+    base = ComplexAzimuthProjection(16, 4, start=2)
+    projection = RangeConditionedComplexAzimuthProjection(
+        base, range_bins=7, bands=3, rank=2)
+    with torch.no_grad():
+        projection.left_real.normal_(std=0.01)
+    path = tmp_path / "range_adapter.pt"
+    torch.save(
+        {
+            "adapter_kind": "range_conditioned",
+            "adapter_config": {
+                "base": {
+                    "source_bins": 16,
+                    "target_bins": 4,
+                    "start": 2,
+                },
+                "range_bins": 7,
+                "bands": 3,
+                "rank": 2,
+            },
+            "adapter": projection.state_dict(),
+        },
+        path,
+    )
+
+    _, restored = load_adapter(path, torch.device("cpu"))
+    value = torch.randn(2, 16, 7, dtype=torch.complex64)
+    torch.testing.assert_close(restored(value), projection(value))
 
 
 def test_load_frame_uses_matched_cube_and_gt_crop(monkeypatch, tmp_path) -> None:

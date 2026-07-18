@@ -445,6 +445,45 @@ rank-4 implementation is retained only as a reproducible compression and
 effective-rank ablation. Pass `--rank 4` to enable it; omitting `--rank` keeps
 the highest-performing full adapter.
 
+### Range-conditioned residual
+
+A fixed-threshold range-band audit showed that the global adapter's largest
+recoverable gains occur at output range cells 16-47. For example, the tol-2
+gain over the physical projection was `+0.04788` in cells 32-47 for held-out
+sequence 101, while cells 0-15 improved by only `+0.00235`. The reverse split
+showed the same pattern. This motivated a range-conditioned residual rather
+than a larger Transformer.
+
+`RangeConditionedComplexAzimuthProjection` keeps the trained global adapter
+frozen and adds four smoothly overlapping triangular range gates. Each gate
+controls a complex rank-2 residual. The four gates add 4,224 trainable real
+parameters and blend continuously at band boundaries. The left factors are
+zero-initialized, so the initial output is bit-exact to the global adapter.
+
+A 100-step balanced profile improved every automatic-threshold held-out metric
+over the global adapter:
+
+| Train | Held out | Adapter | Strict F1 | Tol-1 F1 | Tol-2 F1 | Tol-4 F1 |
+|---|---:|---|---:|---:|---:|---:|
+| 100 | 101 | global | 0.01796 | 0.11240 | 0.20090 | 0.34895 |
+| 100 | 101 | range-conditioned | 0.01803 | 0.11289 | 0.20119 | 0.34914 |
+| 101 | 100 | global | 0.01418 | 0.09026 | 0.16369 | 0.30135 |
+| 101 | 100 | range-conditioned | 0.01442 | 0.09116 | 0.16543 | 0.30234 |
+
+At the shared `logit > 0` threshold, tol-2/tol-4 gains were
+`+0.00036/+0.00123` on sequence 101 and `+0.00114/+0.00222` on sequence 100.
+A 300-step profile shifted the operating point toward high-confidence
+predictions: at `logit > 1`, sequence 100 improved tol-2/tol-4 by
+`+0.00489/+0.00672`, but it gave up small low-threshold recall. The 100-step
+checkpoint is therefore the balanced default; the 300-step checkpoint is an
+explicit high-confidence ablation.
+
+These gains are smaller than the first global-adapter gain, but they repeat in
+both sequence-disjoint directions and at shared thresholds. They support the
+hypothesis that RADs' pseudo-A256 statistics require some range-local angular
+remapping. They do not justify a larger decoder until dense RADs labels are
+available.
+
 It does **not** demonstrate solved monocular-style depth on RADs. `RADs_gt` is
 sparse radar occupancy rather than dense LiDAR depth, and the adapter receives
 no direct depth supervision. The central invalid wedge in first-hit depth
@@ -464,4 +503,23 @@ python scripts/evaluate_rads_azimuth_adapter.py \
   --checkpoint <query-mixer.ckpt> --hparams <hparams.yaml> \
   --adapter <adapter-run>/best_adapter.pt --sequence 101 \
   --out <adapter-run>/full_seq101.json
+
+python scripts/train_rads_range_conditioned_adapter.py \
+  --data-root <data-root> --manifest <manifest.json> \
+  --checkpoint <query-mixer.ckpt> --hparams <hparams.yaml> \
+  --base-adapter <adapter-run>/best_adapter.pt \
+  --train-sequence 100 --val-sequence 101 --steps 100 \
+  --out <range-adapter-run>
+
+python scripts/evaluate_rads_azimuth_adapter.py \
+  --data-root <data-root> --manifest <manifest.json> \
+  --checkpoint <query-mixer.ckpt> --hparams <hparams.yaml> \
+  --adapter <range-adapter-run>/best_adapter.pt --sequence 101 \
+  --out <range-adapter-run>/full_seq101.json
+
+python scripts/audit_rads_adapter_range_bands.py \
+  --data-root <data-root> --manifest <manifest.json> \
+  --checkpoint <query-mixer.ckpt> --hparams <hparams.yaml> \
+  --adapter <range-adapter-run>/best_adapter.pt --sequence 101 \
+  --out <range-adapter-run>/range_band_audit_seq101.json
 ```

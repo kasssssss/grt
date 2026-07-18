@@ -10,13 +10,38 @@ from pathlib import Path
 import torch
 
 from deepradar import DeepRadar
-from deepradar.modules import ComplexAzimuthProjection
+from deepradar.modules import (
+    ComplexAzimuthProjection,
+    RangeConditionedComplexAzimuthProjection,
+)
 from scripts.train_rads_azimuth_adapter import evaluate
 
 
-def load_adapter(path: Path, device: torch.device) -> tuple[dict, ComplexAzimuthProjection]:
+AzimuthAdapter = (
+    ComplexAzimuthProjection | RangeConditionedComplexAzimuthProjection
+)
+
+
+def load_adapter(
+    path: Path, device: torch.device
+) -> tuple[dict, AzimuthAdapter]:
     saved = torch.load(path, map_location=device, weights_only=False)
     config = saved.get("adapter_config")
+    if saved.get("adapter_kind") == "range_conditioned":
+        if config is None or "base" not in config:
+            raise ValueError(
+                "Portable range-conditioned checkpoints require an "
+                "adapter_config.base section."
+            )
+        base = ComplexAzimuthProjection(**config["base"])
+        adapter = RangeConditionedComplexAzimuthProjection(
+            base,
+            range_bins=int(config["range_bins"]),
+            bands=int(config["bands"]),
+            rank=int(config["rank"]),
+        ).to(device)
+        adapter.load_state_dict(saved["adapter"])
+        return saved, adapter.eval()
     if config is None:
         initial = saved["adapter"]["initial"]
         config = {

@@ -130,6 +130,9 @@ def main() -> None:
 
     device = torch.device("cuda")
     saved, adapter = load_adapter(args.adapter, device)
+    range_conditioned = saved.get("adapter_kind") == "range_conditioned"
+    baseline_label = "Global adapter" if range_conditioned else "Physical projection"
+    adapted_label = "Range-conditioned adapter" if range_conditioned else "Global adapter"
     phase_mode = saved.get("phase_mode", "zero") if args.phase_mode == "auto" else args.phase_mode
     model = DeepRadar.load_from_checkpoint(
         str(args.checkpoint), hparams_file=str(args.hparams), map_location=device
@@ -178,11 +181,12 @@ def main() -> None:
             show_magnitude(axes[0, 0], raw_ra, "Cropped raw RA (A256)")
             label_axes(axes[0, 0], "range bin", "azimuth bin")
             show_magnitude(
-                axes[0, 1], baseline_input, "Physical start-4 A8 input", input_vmax)
+                axes[0, 1], baseline_input,
+                f"{baseline_label} A8 input", input_vmax)
             label_axes(axes[0, 1], "range bin", "A8 channel")
             show_magnitude(
                 axes[0, 2], adapted_input,
-                f"Learned A8 input (step {saved['step']})", input_vmax)
+                f"{adapted_label} A8 input (step {saved['step']})", input_vmax)
             label_axes(axes[0, 2], "range bin", "A8 channel")
             axes[0, 3].imshow(
                 target.astype(np.float32),
@@ -199,23 +203,23 @@ def main() -> None:
 
             show_bev(
                 axes[1, 0], baseline_bev, target,
-                f"Baseline BEV logit>{args.bev_threshold:g} "
+                f"{baseline_label} BEV logit>{args.bev_threshold:g} "
                 f"| tol2 F1={baseline_f1:.4f}")
             label_axes(axes[1, 0], "range cell", "azimuth cell")
             show_bev(
                 axes[1, 1], adapted_bev, target,
-                f"Adapter BEV logit>{args.bev_threshold:g} "
+                f"{adapted_label} BEV logit>{args.bev_threshold:g} "
                 f"| tol2 F1={adapted_f1:.4f}")
             label_axes(axes[1, 1], "range cell", "azimuth cell")
             show_depth(
                 axes[1, 2], baseline_depth,
-                f"Baseline first-hit logit>{args.depth_threshold:g} "
+                f"{baseline_label} first-hit logit>{args.depth_threshold:g} "
                 f"| valid={baseline_valid:.3f}")
             label_axes(
                 axes[1, 2], "azimuth output cell", "elevation output cell")
             show_depth(
                 axes[1, 3], adapted_depth,
-                f"Adapter first-hit logit>{args.depth_threshold:g} "
+                f"{adapted_label} first-hit logit>{args.depth_threshold:g} "
                 f"| valid={adapted_valid:.3f}")
             label_axes(
                 axes[1, 3], "azimuth output cell", "elevation output cell")
